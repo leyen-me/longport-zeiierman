@@ -23,7 +23,13 @@ import pandas as pd
 from .config import ZTPConfig
 from .live import LiveStrategy, StrategyAction
 from .logging import get_logger, setup_logging
-from .longport_data import ET_TZ, _config, candle_ts_to_et, load_cache
+from .longport_data import (
+    ET_TZ,
+    _config,
+    bootstrap_history,
+    candle_ts_to_et,
+    load_cache,
+)
 from .options import pick_option, top_bid
 from .paths import data_dir, results_dir
 
@@ -44,6 +50,15 @@ class LiveRunner:
     def __init__(self, dry_run: bool = False, budget: float = 200.0,
                  target_delta: float = 0.50):
         os.environ.setdefault("LONGPORT_PUSH_CANDLESTICK_MODE", "confirmed")
+        missing = [
+            k for k in ("LONGPORT_APP_KEY", "LONGPORT_APP_SECRET", "LONGPORT_ACCESS_TOKEN")
+            if not os.environ.get(k)
+        ]
+        if missing:
+            raise SystemExit(
+                f"缺少环境变量: {', '.join(missing)} "
+                f"(Zeabur: 服务设置 -> 环境变量; docker: docker run -e ...)"
+            )
         setup_logging(results_dir())
         self.cfg = ZTPConfig(symbol=SYMBOL)
         self.dry_run = dry_run
@@ -79,7 +94,11 @@ class LiveRunner:
         return df[~df.index.duplicated()].sort_index()
 
     def sync_history(self):
-        base = load_cache(SYMBOL, "none")
+        try:
+            base = load_cache(SYMBOL, "none")
+        except FileNotFoundError:
+            log.warning("本地无K线缓存, 首次启动自动拉取近120天历史预热")
+            base = bootstrap_history(SYMBOL, days=120, adjust="none")
         if self.tail_path.exists():
             tail = pd.read_parquet(self.tail_path)
             base = pd.concat([base, tail]).loc[lambda d: ~d.index.duplicated()].sort_index()

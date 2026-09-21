@@ -158,6 +158,25 @@ def load_cache(symbol: str = "SPY.US", adjust: str = "forward") -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+def cache_path(symbol: str = "SPY.US", adjust: str = "forward") -> Path:
+    tag = adjust[:3]
+    return CACHE_DIR / f"{symbol.replace('.', '_')}_{tag}_min2.parquet"
+
+
+def bootstrap_history(symbol: str = "SPY.US", days: int = 120,
+                      adjust: str = "none") -> pd.DataFrame:
+    """本地无缓存时, 首次启动从长桥拉取近 N 天历史并写入缓存。"""
+    end = datetime.now(ET_TZ).date()
+    start = end - timedelta(days=days)
+    print(f"[bootstrap] 本地无缓存, 拉取 {start} ~ {end} 的2分钟线 (约1分钟)...")
+    df = fetch_range(symbol, start, end, adjust)
+    if df.empty:
+        raise RuntimeError("bootstrap 拉取到 0 根 bar, 请检查行情权限/网络")
+    df.to_parquet(cache_path(symbol, adjust))
+    print(f"[bootstrap] 完成: {len(df)} 根 bar -> {df.index.min()} ~ {df.index.max()}")
+    return df
+
+
 if __name__ == "__main__":
     import argparse
 

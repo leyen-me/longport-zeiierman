@@ -66,17 +66,24 @@ cp .env.example .env   # 填入长桥 API 凭证
 .venv/bin/python scripts/live_run.py             # 真实下单
 ```
 
-**Docker 部署（日本/任意服务器）：**
+**Docker / PaaS 部署（日本/任意服务器）：**
 
-凭证通过环境变量注入（无需 .env 文件）：
+凭证通过环境变量注入（无需 .env 文件），容器首次启动会自动拉取近 120 天 K 线预热：
 
 ```bash
-export LONGPORT_APP_KEY=xxx
-export LONGPORT_APP_SECRET=xxx
-export LONGPORT_ACCESS_TOKEN=xxx
-docker compose up -d --build
+docker run -d --name ztp-live \
+  -e LONGPORT_APP_KEY=xxx \
+  -e LONGPORT_APP_SECRET=xxx \
+  -e LONGPORT_ACCESS_TOKEN=xxx \
+  -v $(pwd)/data_cache:/app/data_cache \
+  -v $(pwd)/results:/app/results \
+  --restart unless-stopped \
+  $(docker build -q .)
 docker logs -f ztp-live
 ```
+
+Zeabur / Railway 等 PaaS：直接导入 GitHub 仓库，在环境变量里配置上述三项即可，
+启动命令为 `python -m ztp.runner`。
 
 > 系统层面持久化：写入 `/etc/environment`、systemd unit 的 `Environment=`，
 > 或 `~/.zshrc` 均可——程序只认环境变量本身。
