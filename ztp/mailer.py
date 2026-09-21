@@ -12,8 +12,9 @@ import os
 import queue
 import smtplib
 import threading
-from email.header import Header
-from email.mime.text import MIMEText
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 
 log = logging.getLogger("ztp")
 
@@ -57,11 +58,14 @@ class Mailer:
                 log.error("邮件最终发送失败: %s", subject)
 
     def _smtp_send(self, subject: str, body: str):
-        msg = MIMEText(body or subject, "plain", "utf-8")
-        msg["Subject"] = Header(subject, "utf-8")
+        msg = EmailMessage()
+        msg["Subject"] = subject
         msg["From"] = self.user
         msg["To"] = self.to_addr
+        msg["Date"] = formatdate(localtime=False)
+        msg["Message-ID"] = make_msgid(domain="qq.com", idstring=datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f"))
+        msg.set_content(body or subject, charset="utf-8")
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as s:
             s.login(self.user, self.secret)
-            s.sendmail(self.user, [self.to_addr], msg.as_string())
+            s.send_message(msg)
         log.info("邮件已发送: %s", subject)
