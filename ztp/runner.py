@@ -30,6 +30,7 @@ from .longport_data import (
     candle_ts_to_et,
     load_cache,
 )
+from .mailer import Mailer
 from .options import pick_option, top_bid
 from .paths import data_dir, results_dir
 
@@ -78,6 +79,9 @@ class LiveRunner:
         self.entering = False
         self.exiting = False
         self._last_bar_ts: pd.Timestamp | None = None
+        self.mailer = Mailer()
+        self._summary_sent_date: str | None = None
+        self._today_trades: list[dict] = []
 
     # ---------- 数据同步 ----------
 
@@ -226,6 +230,11 @@ class LiveRunner:
             filled = self._submit_and_wait(pick.symbol, "Buy", pick.qty, pick.ask)
             if filled <= 0:
                 log.warning("期权买入未成交, 回滚信号")
+                self.mailer.send(
+                    f"[ZTP] 买入失败, 信号回滚 ({'LONG' if is_call else 'SHORT'})",
+                    f"目标: {pick.qty}x {pick.symbol} @ {pick.ask}\nSPY={spot}\n"
+                    f"时间={_now():%H:%M:%S} ET",
+                )
                 self.strategy.st.pos_dir = 0
                 self.strategy.st.entry_i = -1
                 return
@@ -237,6 +246,12 @@ class LiveRunner:
                 "time": _now().isoformat(),
             }
             self.save_state()
+            self.mailer.send(
+                f"[ZTP] 买入 {filled}x {pick.symbol} @ ~{pick.ask}",
+                f"方向: {'LONG(call)' if is_call else 'SHORT(put)'}\n"
+                f"行权价: {pick.strike}  delta={pick.delta:.2f}\n"
+                f"SPY={spot}  信号价={ref_price}\n时间={_now():%H:%M:%S} ET",
+            )
         except Exception as e:
             log.error(f"期权入场异常, 回滚信号: {e!r}", exc_info=True)
             self.strategy.st.pos_dir = 0
@@ -293,16 +308,18 @@ class LiveRunner:
             pass
         return done
 
-    def _exit_chase(self, osym: str, qty: int) -> int:
+    def _exit_chase(self, osym: str, qty: int) -> tuple[int, float | None]:
         """平仓追价循环: 卖出必须成交。
 
         每轮: 取最新 bid, 挂限价卖出; 12 秒未全部成交则撤单,
         价格每轮再降 0.05 (最多累计降 0.30, 兜底 0.01) 重新挂出。
         bid=0 (无买盘) 时直接挂 0.01。15:58 ET 后加速降档。
+        返回 (成交张数, 最后成交档位价)。
         """
         remaining = qty
         cycle = 0
         total_filled = 0
+        last_px: float | None = None
         while remaining > 0:
             if cycle > 100:
                 log.error("追价超过100轮仍未全部成交, 剩余 %d 张, 请人工处理!", remaining)
@@ -329,11 +346,12 @@ class LiveRunner:
             if done > 0:
                 remaining -= done
                 total_filled += done
+                last_px = px
                 cycle = 0
             else:
                 cycle += 1
             time_mod.sleep(1)
-        return total_filled
+        return total_filled, last_px
 
     def _option_exit(self, reason: str):
         op = self.option_pos
@@ -345,23 +363,27 @@ class LiveRunner:
             if self.dry_run:
                 bid = top_bid(self.qctx, op["symbol"])
                 log.info(f"[DRY-RUN] 卖出 {op['qty']}x {op['symbol']} @ ~{bid} ({reason})")
-                self.notify_exit(reason)
+                self.notify_exit(reason, est_exit_px_ref=bid)
                 return
-            filled = self._exit_chase(op["symbol"], op["qty"])
+            filled, last_px = self._exit_chase(op["symbol"], op["qty"])
             if filled < op["qty"]:
                 log.error(
                     f"!! 平仓未完成: {filled}/{op['qty']} 张已成交, "
                     f"剩余请人工处理 !!"
                 )
+                self.mailer.send(
+                    f"[ZTP][紧急] 平仓未完成 {filled}/{op['qty']} 张!",
+                    f"{op['symbol']} 原因={reason}\n请立即人工处理!\n时间={_now():%H:%M:%S} ET",
+                )
             if filled > 0:
                 self.strategy.st.pos_qty = filled
-                self.notify_exit(reason)
+                self.notify_exit(reason, est_exit_px_ref=last_px)
         except Exception as e:
             log.error(f"平仓异常: {e!r}", exc_info=True)
         finally:
             self.exiting = False
 
-    def notify_exit(self, reason: str):
+    def notify_exit(self, reason: str, est_exit_px_ref: float | None = None):
         spot = self._underlying_last()
         self.strategy.notify_exit_fill(spot, reason)
         op = self.option_pos
@@ -371,6 +393,24 @@ class LiveRunner:
             t["qty"] = op["qty"]
             t["time"] = _now().isoformat()
             self.record_trade(t)
+            self._today_trades.append(t)
+
+            spot_in = float(op["spot_at_entry"])
+            spot_chg = (spot / spot_in - 1) * 100 if spot_in else 0.0
+            est_pnl = ""
+            if est_exit_px_ref:
+                est = (est_exit_px_ref - float(op["ask_ref"])) * 100 * op["qty"]
+                est_pnl = f"期权盈亏(估): {est:+.0f}$ (卖~{est_exit_px_ref} - 买~{op['ask_ref']})\n"
+            holding = ""
+            if self.strategy.closed_trades:
+                holding = f"持仓时长: {self.strategy.closed_trades[-1].get('bars_held', '?')} 根bar\n"
+            self.mailer.send(
+                f"[ZTP] 平仓({reason}) SPY={spot}",
+                f"{op['qty']}x {op['symbol']} (strike={op['strike']})\n"
+                f"SPY: {spot_in} -> {spot} ({spot_chg:+.2f}%)\n"
+                f"{est_pnl}{holding}"
+                f"时间={_now():%H:%M:%S} ET",
+            )
         self.option_pos = None
         self.save_state()
         log.info(f"平仓完成 ({reason}) SPY={spot}")
@@ -393,6 +433,11 @@ class LiveRunner:
         log.info(
             f"启动完成: dry_run={self.dry_run} 预算={self.budget} "
             f"目标delta={self.target_delta} 账户={'模拟' if not self.dry_run else 'N/A'}"
+        )
+        self.mailer.send(
+            f"[ZTP] 服务启动 {_now():%m-%d %H:%M} ET",
+            f"dry_run={self.dry_run}\n预算=${self.budget:.0f} 目标delta={self.target_delta}\n"
+            f"缓存bar数={len(self.strategy.df)}\n最新收盘={self.strategy.df.index.max()}",
         )
         while True:
             try:
@@ -473,9 +518,16 @@ class LiveRunner:
             return
         self.last_reconcile = now
         now_et = _now()
-        if not (570 <= _et_minutes(now_et) < 960):
+        m = _et_minutes(now_et)
+        if m < 570:
+            if self._summary_sent_date and self._summary_sent_date != now_et.date().isoformat():
+                self._today_trades = []
+                self._summary_sent_date = None
+            return
+        self._maybe_daily_summary(now_et)
+        if not (570 <= m < 960):
             st = self.strategy.st
-            if st.pos_dir != 0 and not self.exiting and _et_minutes(now_et) >= 15 * 60 + 47:
+            if st.pos_dir != 0 and not self.exiting and m >= 15 * 60 + 47:
                 log.warning("强平窗口(RTH外兜底): 平掉期权持仓")
                 self._option_exit("EOD")
             return
@@ -492,6 +544,32 @@ class LiveRunner:
             if self.strategy.st.pos_dir != 0:
                 q = self.qctx.quote([SYMBOL])[0]
                 self.handle_quote(q)
+
+    def _maybe_daily_summary(self, now_et: datetime):
+        today = now_et.date().isoformat()
+        if self._summary_sent_date == today:
+            return
+        m = _et_minutes(now_et)
+        if m < 15 * 60 + 50 or self.strategy.st.pos_dir != 0 or self.exiting:
+            return
+        self._summary_sent_date = today
+        if not self._today_trades:
+            self.mailer.send(
+                f"[ZTP] 当日总结 {now_et:%Y-%m-%d}",
+                "今日无交易。\n(服务正常运行)",
+            )
+            return
+        lines = []
+        for t in self._today_trades:
+            chg = (float(t["exit_price"]) / float(t["entry_price"]) - 1) * 100
+            lines.append(
+                f"{t['direction']} {t['qty']}x {t.get('symbol', '?')}  "
+                f"{t['entry_price']} -> {t['exit_price']} ({chg:+.2f}%)  [{t['exit_reason']}]"
+            )
+        self.mailer.send(
+            f"[ZTP] 当日总结 {now_et:%Y-%m-%d}: {len(self._today_trades)} 笔",
+            "\n".join(lines) + f"\n\n时间={_now():%H:%M:%S} ET",
+        )
 
 
 if __name__ == "__main__":
