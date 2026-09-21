@@ -1,0 +1,16 @@
+services:
+  ztp-live:
+    build: .
+    container_name: ztp-live
+    env_file: .env
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./data_cache:/app/data_cache
+      - ./results:/app/results
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
