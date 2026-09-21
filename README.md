@@ -68,11 +68,18 @@ cp .env.example .env   # 填入长桥 API 凭证
 
 **Docker 部署（日本/任意服务器）：**
 
+凭证通过环境变量注入（无需 .env 文件）：
+
 ```bash
-cp .env.example .env   # 填入凭证
+export LONGPORT_APP_KEY=xxx
+export LONGPORT_APP_SECRET=xxx
+export LONGPORT_ACCESS_TOKEN=xxx
 docker compose up -d --build
 docker logs -f ztp-live
 ```
+
+> 系统层面持久化：写入 `/etc/environment`、systemd unit 的 `Environment=`，
+> 或 `~/.zshrc` 均可——程序只认环境变量本身。
 
 ## 策略参数（与 Pine 默认一致）
 

@@ -2,8 +2,11 @@ services:
   ztp-live:
     build: .
     container_name: ztp-live
-    env_file: .env
     environment:
+      - LONGPORT_APP_KEY=${LONGPORT_APP_KEY:-}
+      - LONGPORT_APP_SECRET=${LONGPORT_APP_SECRET:-}
+      - LONGPORT_ACCESS_TOKEN=${LONGPORT_ACCESS_TOKEN:-}
+      - LONGPORT_HTTP_URL=${LONGPORT_HTTP_URL:-}
       - TZ=UTC
     volumes:
       - ./data_cache:/app/data_cache
