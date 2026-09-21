@@ -244,8 +244,14 @@ class LiveRunner:
         finally:
             self.entering = False
 
+    def _order_status(self, order_id) -> tuple[str, int]:
+        od = self.tctx.order_detail(order_id)
+        return str(od.status), int(od.executed_quantity)
+
     def _submit_and_wait(self, osym: str, side: str, qty: int, ref_px: float,
-                         aggressive: bool = False) -> int:
+                         aggressive: bool = False, poll_secs: int = 4,
+                         wait_secs: int = 90) -> int:
+        """挂限价单并等待, 超时撤单。返回累计成交张数(可能为部分成交)。"""
         px = Decimal(str(ref_px)).quantize(Decimal("0.01"))
         if aggressive:
             px = px - Decimal("0.05") if side == "Sell" else px + Decimal("0.05")
@@ -259,29 +265,75 @@ class LiveRunner:
             remark="ZTP",
         )
         log.info(f"下单 {side} {qty}x {osym} @ {px} (order_id={order.order_id})")
-        deadline = time_mod.time() + 90
+        deadline = time_mod.time() + wait_secs
         while time_mod.time() < deadline:
-            time_mod.sleep(4)
+            time_mod.sleep(poll_secs)
             try:
-                od = self.tctx.order_detail(order.order_id)
-                status = str(od.status)
-                done = int(od.executed_quantity)
+                status, done = self._order_status(order.order_id)
             except Exception as e:
                 log.warning(f"查询订单失败: {e}")
                 continue
-            if "Filled" in status and "Not" not in status and "Partial" not in status:
+            if status.endswith("OrderStatus.Filled"):
                 log.info(f"成交: {done} 张 @ ~{px}")
                 return done
-            if "Canceled" in status or "Rejected" in status or "Expired" in status:
+            if "Rejected" in status or "Expired" in status:
                 log.warning(f"订单终结: {status}")
                 return done
             if time_mod.time() > deadline - 30 and "Partial" not in status:
                 try:
                     self.tctx.cancel_order(order.order_id)
-                    log.info("超时撤单")
                 except Exception:
                     pass
-        return 0
+        try:
+            status, done = self._order_status(order.order_id)
+            if "Canceled" not in status and "Filled" not in status:
+                self.tctx.cancel_order(order.order_id)
+                status, done = self._order_status(order.order_id)
+        except Exception:
+            pass
+        return done
+
+    def _exit_chase(self, osym: str, qty: int) -> int:
+        """平仓追价循环: 卖出必须成交。
+
+        每轮: 取最新 bid, 挂限价卖出; 12 秒未全部成交则撤单,
+        价格每轮再降 0.05 (最多累计降 0.30, 兜底 0.01) 重新挂出。
+        bid=0 (无买盘) 时直接挂 0.01。15:58 ET 后加速降档。
+        """
+        remaining = qty
+        cycle = 0
+        total_filled = 0
+        while remaining > 0:
+            if cycle > 100:
+                log.error("追价超过100轮仍未全部成交, 剩余 %d 张, 请人工处理!", remaining)
+                break
+            m = _et_minutes(_now())
+            if m >= 15 * 60 + 59 and cycle > 5:
+                log.error("已到 15:59 仍有 %d 张未成交, 停止追价, 请人工处理!", remaining)
+                break
+            bid = top_bid(self.qctx, osym)
+            chase = min(cycle, 6) * 0.05
+            if m >= 15 * 60 + 58:
+                chase += 0.10
+            px = max(round((bid if bid > 0 else 0.05) - chase, 2), 0.01)
+            log.info(f"追价平仓 第{cycle+1}轮: 卖 {remaining}x @ {px} (bid={bid})")
+            try:
+                done = self._submit_and_wait(
+                    osym, "Sell", remaining, px, poll_secs=3, wait_secs=12
+                )
+            except Exception as e:
+                log.error(f"追价下单异常: {e!r}")
+                time_mod.sleep(3)
+                cycle += 1
+                continue
+            if done > 0:
+                remaining -= done
+                total_filled += done
+                cycle = 0
+            else:
+                cycle += 1
+            time_mod.sleep(1)
+        return total_filled
 
     def _option_exit(self, reason: str):
         op = self.option_pos
@@ -290,20 +342,20 @@ class LiveRunner:
             return
         self.exiting = True
         try:
-            bid = top_bid(self.qctx, op["symbol"])
             if self.dry_run:
+                bid = top_bid(self.qctx, op["symbol"])
                 log.info(f"[DRY-RUN] 卖出 {op['qty']}x {op['symbol']} @ ~{bid} ({reason})")
                 self.notify_exit(reason)
                 return
-            filled = self._submit_and_wait(op["symbol"], "Sell", op["qty"], bid)
-            if filled <= 0:
-                filled = self._submit_and_wait(
-                    op["symbol"], "Sell", op["qty"], max(bid - 0.10, 0.01), aggressive=True
+            filled = self._exit_chase(op["symbol"], op["qty"])
+            if filled < op["qty"]:
+                log.error(
+                    f"!! 平仓未完成: {filled}/{op['qty']} 张已成交, "
+                    f"剩余请人工处理 !!"
                 )
-                if filled <= 0:
-                    log.error("!! 卖出失败, 请手动处理持仓 !!")
-                    return
-            self.notify_exit(reason)
+            if filled > 0:
+                self.strategy.st.pos_qty = filled
+                self.notify_exit(reason)
         except Exception as e:
             log.error(f"平仓异常: {e!r}", exc_info=True)
         finally:
