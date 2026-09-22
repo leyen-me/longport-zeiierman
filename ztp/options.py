@@ -47,8 +47,8 @@ def years_to_expiry(expiry: date, now: datetime) -> float:
 def _top_of_book(qctx, sym: str) -> tuple[float, float]:
     try:
         d = qctx.depth(sym)
-        bid = float(d.bid_depth[0].price) if d.bid_depth else 0.0
-        ask = float(d.ask_depth[0].price) if d.ask_depth else 0.0
+        bid = float(d.bids[0].price) if d.bids and d.bids[0].price is not None else 0.0
+        ask = float(d.asks[0].price) if d.asks and d.asks[0].price is not None else 0.0
         return bid, ask
     except Exception:
         return 0.0, 0.0

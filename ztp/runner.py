@@ -137,11 +137,11 @@ class LiveRunner:
         )
         log.info("已订阅: SPY 报价推送 + 2分钟K线(confirmed)推送")
 
-    def _on_quote(self, quote):
+    def _on_quote(self, symbol, quote):
         self.last_push_ts = time_mod.time()
         self.events.put(("quote", quote))
 
-    def _on_candlestick(self, candle):
+    def _on_candlestick(self, symbol, candle):
         self.last_push_ts = time_mod.time()
         if candle.is_confirmed and candle.period == self.openapi.Period.Min_2:
             self.events.put(("bar", candle.candlestick))
@@ -498,8 +498,12 @@ class LiveRunner:
         for act in self.strategy.on_bar():
             if act.kind in ("enter_long", "enter_short"):
                 direction = 1 if act.kind == "enter_long" else -1
+                self._option_entry(direction, act.price, act.bar_index)
+                if self.strategy.st.pos_dir != 0 and self.option_pos is None:
+                    log.warning("入场未建立期权持仓, 回滚信号")
+                    self.strategy.st.pos_dir = 0
+                    self.strategy.st.entry_i = -1
                 self.save_state()
-                self._option_entry(direction, act.price, act.bar_i)
             elif act.kind == "arm_tpsl":
                 log.info(f"TP/SL 已布防: {act.text}")
                 self.save_state()
