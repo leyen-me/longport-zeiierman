@@ -39,14 +39,6 @@ def candle_ts_to_et(naive_dt) -> pd.Timestamp:
 
 def _config():
     from longport import openapi
-
-    os.environ.setdefault("LONGPORT_HTTP_URL", "https://openapi.longportapp.com")
-    os.environ.setdefault(
-        "LONGPORT_QUOTE_WS_URL", "wss://openapi-quote.longportapp.com"
-    )
-    os.environ.setdefault(
-        "LONGPORT_TRADE_WS_URL", "wss://openapi-trade.longportapp.com"
-    )
     return openapi.Config.from_apikey_env()
 
 

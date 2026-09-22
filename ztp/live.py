@@ -244,7 +244,7 @@ class LiveStrategy:
         st = self.st
         if st.pos_dir == 0 or not st.exit_armed:
             return None
-        if len(self.df) - 1 < st.exit_from:
+        if len(self.df) < st.exit_from:
             return None
         if st.pos_dir > 0:
             if price <= st.sl_px:

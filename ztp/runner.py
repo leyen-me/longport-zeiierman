@@ -16,7 +16,7 @@ import os
 import queue
 import time as time_mod
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 import pandas as pd
 
@@ -259,17 +259,25 @@ class LiveRunner:
         finally:
             self.entering = False
 
-    def _order_status(self, order_id) -> tuple[str, int]:
+    def _order_status(self, order_id):
         od = self.tctx.order_detail(order_id)
-        return str(od.status), int(od.executed_quantity)
+        return od.status, int(od.executed_quantity)
+
+    @staticmethod
+    def _tick_align(px: Decimal, side: str) -> Decimal:
+        tick = Decimal("0.05") if px >= Decimal("3") else Decimal("0.01")
+        rounding = ROUND_CEILING if side == "Buy" else ROUND_FLOOR
+        return ((px / tick).to_integral_value(rounding=rounding) * tick).quantize(Decimal("0.01"))
 
     def _submit_and_wait(self, osym: str, side: str, qty: int, ref_px: float,
                          aggressive: bool = False, poll_secs: int = 4,
                          wait_secs: int = 90) -> int:
         """挂限价单并等待, 超时撤单。返回累计成交张数(可能为部分成交)。"""
-        px = Decimal(str(ref_px)).quantize(Decimal("0.01"))
+        px = Decimal(str(ref_px))
         if aggressive:
             px = px - Decimal("0.05") if side == "Sell" else px + Decimal("0.05")
+        px = self._tick_align(px, side)
+        OS = self.openapi.OrderStatus
         order = self.tctx.submit_order(
             symbol=osym,
             order_type=self.openapi.OrderType.LO,
@@ -280,6 +288,7 @@ class LiveRunner:
             remark="ZTP",
         )
         log.info(f"下单 {side} {qty}x {osym} @ {px} (order_id={order.order_id})")
+        done = 0
         deadline = time_mod.time() + wait_secs
         while time_mod.time() < deadline:
             time_mod.sleep(poll_secs)
@@ -288,20 +297,22 @@ class LiveRunner:
             except Exception as e:
                 log.warning(f"查询订单失败: {e}")
                 continue
-            if status.endswith("OrderStatus.Filled"):
+            if status == OS.Filled:
                 log.info(f"成交: {done} 张 @ ~{px}")
                 return done
-            if "Rejected" in status or "Expired" in status:
+            if status in (OS.Rejected, OS.Expired):
                 log.warning(f"订单终结: {status}")
                 return done
-            if time_mod.time() > deadline - 30 and "Partial" not in status:
+            if time_mod.time() > deadline - 30 and status not in (
+                OS.PartialFilled, OS.PartialWithdrawal
+            ):
                 try:
                     self.tctx.cancel_order(order.order_id)
                 except Exception:
                     pass
         try:
             status, done = self._order_status(order.order_id)
-            if "Canceled" not in status and "Filled" not in status:
+            if status not in (OS.Canceled, OS.Filled):
                 self.tctx.cancel_order(order.order_id)
                 status, done = self._order_status(order.order_id)
         except Exception:
@@ -501,8 +512,6 @@ class LiveRunner:
     def handle_quote(self, quote) -> None:
         st = self.strategy.st
         if st.pos_dir == 0 or not st.exit_armed or self.exiting:
-            return
-        if len(self.strategy.df) - 1 < st.exit_from:
             return
         px = float(quote.last_done)
         act = self.strategy.check_tpsl(px)
