@@ -1,0 +1,470 @@
+//@version=6
+// ==============================================================================
+// 由指标 "Zeiierman Trend Pressure (Zeiierman)" 转换而来的日内策略
+// 原指标 © Zeiierman — CC BY-NC-SA 4.0
+//
+// 信号模块:
+//   Cross : Z-Pulse 上/下穿 Z-Trend, 顺势入场
+//
+// 风控框架(与 IntradayTemplate 一致):
+//   信号时段 / 强制平仓时间点 / 每日最大交易次数
+//   回调等待超时 / ATR 止盈止损
+//
+// 绘图参考 LuxAlgo 开源指标手法:
+//   透明底箭头标签 / line+box 结构与价格线 / 右端价格标签 / 状态 table
+// ==============================================================================
+strategy("Zeiierman Trend Pressure Strategy (Lux Style)", shorttitle="ZTP-S v2", overlay=true,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     calc_on_every_tick=false,
+     process_orders_on_close=true,
+     max_labels_count=500,
+     max_lines_count=500)
+
+// --- 颜色常量 (对齐 LuxAlgo 配色) ---
+const color BULL_COLOR    = #089981
+const color BEAR_COLOR    = #f23645
+const color NEUTRAL_COLOR = #787b86
+const color PULSE_COLOR   = #2962ff
+const color TRANSP        = #00000000
+
+// --- 策略 ID ---
+const string MARKET_SESSION = "0930-1600"
+const string LONG_ENTRY_ID  = "LONG"
+const string SHORT_ENTRY_ID = "SHORT"
+const string LONG_EXIT_ID   = "Long Exit"
+const string SHORT_EXIT_ID  = "Short Exit"
+
+// ================= 通用风控参数 =================
+tradeSessionInput      = input.session("0930-1230", "信号发生时段", group="交易时段")
+forceCloseHourInput    = input.int(14, "强制平仓 时 (整点)", minval=0, maxval=23, group="交易时段", tooltip="到达该整点后，下一根K线开始时平掉所有仓位，例如填 14 表示 14:00 平仓")
+
+maxTradesPerDay = input.int(2, "每日最大交易次数", minval=0, maxval=20, tooltip="0 表示不限制", group="交易频率")
+
+usePullbackEntry = input.bool(true, "使用回调入场", group="回调入场", tooltip="开启后信号出现不直接入场，等价格回踩均线再顺势入场")
+pullbackEMALen   = input.int(12, "回调 EMA 周期", minval=1, group="回调入场")
+maxPullbackBars  = input.int(8, "回调等待最大K线数", minval=0, group="回调入场", tooltip="超过该根数未回踩则放弃信号，0 表示不限制")
+
+atrLength           = input.int(14, "ATR 周期", minval=1, group="止损止盈")
+atrTakeProfitMult   = input.float(4, "ATR 止盈倍数", step=0.1, minval=0.1, group="止损止盈")
+atrStopLossMult     = input.float(1.5, "ATR 止损倍数", step=0.1, minval=0.1, group="止损止盈")
+
+// ================= 可视化参数 =================
+show_signals      = input.bool(true, "显示信号标签", group="可视化")
+show_zones        = input.bool(true, "显示止盈/止损渐变区", group="可视化")
+show_price_labels = input.bool(true, "显示右端价格标签", group="可视化")
+show_exit_labels  = input.bool(true, "显示平仓标签(含盈亏)", group="可视化")
+show_status_table = input.bool(true, "显示状态面板", group="可视化")
+show_trend_bg     = input.bool(true, "趋势背景着色", group="可视化")
+show_pullback_ema = input.bool(true, "显示回调 EMA", group="可视化")
+color_candles     = input.bool(false, "按趋势给K线染色", group="可视化")
+
+// ================= 主图信号带参数 =================
+show_zband    = input.bool(true, "主图叠加 Z-Pulse/Z-Trend 带", group="信号线(主图叠加)", tooltip="把 -100~0 的振荡值映射到价格下方窄带，不挤压K线")
+zBandAnchorLB = input.int(50, "锚定低点回看", minval=10, group="信号线(主图叠加)")
+zBandGapAtr   = input.float(0.6, "离低点间距(ATR)", step=0.1, minval=0, group="信号线(主图叠加)")
+zBandAtrMult  = input.float(4.0, "信号带高度(ATR)", step=0.5, minval=1, group="信号线(主图叠加)")
+
+// =============================================================================
+// ★ 信号模块 (来自原指标 Zeiierman Trend Pressure)
+// =============================================================================
+fl=input.int(21,"Pulse Range",minval=3,group="信号参数(Z-Pulse)")
+pl=input.int(9,"Pulse Stochastic",minval=3,group="信号参数(Z-Pulse)")
+ps=input.int(7,"Pulse Smoothing",minval=1,maxval=50,group="信号参数(Z-Pulse)")
+
+sl=input.int(55,"Trend Range",minval=5,group="信号参数(Z-Trend)")
+ml=input.int(120,"Macro Trend",minval=10,group="信号参数(Z-Trend)")
+ts=input.int(5,"Trend Smoothing",minval=1,maxval=30,group="信号参数(Z-Trend)")
+db=input.float(9.0,"Trend Persistence",minval=0.0,maxval=20.0,step=0.5,group="信号参数(Z-Trend)")
+
+// --- 核心常量 ---
+const float sw=0.18
+const float mw=0.72
+const float th=0.92
+
+// --- 状态 ---
+F=0
+S=1
+M=2
+
+var float ud=0.0
+var float dd=0.0
+var float tz=na
+
+// --- 辅助函数 ---
+clp(float v,float lo,float hi)=>math.max(lo,math.min(hi,v))
+sm(float v,int k)=>k>1?ta.ema(v,k):v
+
+wr(int k)=>
+    hh=ta.highest(high,k)
+    ll=ta.lowest(low,k)
+    100.0*(close-hh)/math.max(hh-ll,syminfo.mintick)
+
+eff(int k)=>
+    p=ta.sma(math.abs(close-close[1]),k)*k
+    n=na(close[k])?na:math.abs(close-close[k])
+    na(p) or na(n)?na:clp(n/math.max(p,syminfo.mintick),0.0,1.0)
+
+stk(float x,int k)=>
+    hi=ta.highest(x,k)
+    lo=ta.lowest(x,k)
+    -100.0+100.0*(x-lo)/math.max(hi-lo,1e-10)
+
+con(array<float> a,array<float> w)=>
+    ws0=w.get(F)+w.get(S)+w.get(M)
+    clp((a.get(F)*w.get(F)+a.get(S)*w.get(S)+a.get(M)*w.get(M))/math.max(ws0,1e-10),-100.0,0.0)
+
+agr(array<float> a)=>
+    d=math.abs(a.get(F)-a.get(S))+math.abs(a.get(S)-a.get(M))+math.abs(a.get(F)-a.get(M))
+    1.0-clp(d/300.0,0.0,1.0)
+
+alpha(float prev,float trg,float mac,float agI,float efI,float base,float hold)=>
+    side=mac>-50.0?1:mac<-50.0?-1:0
+    pull=(side==1 and trg<prev) or (side==-1 and trg>prev)
+    lk=clp(0.15+agI*efI*hold,0.0,0.97)
+    pull?math.max(0.015,base*(1.0-lk)):math.max(base*0.75,0.03)
+
+// --- Z-Pulse 引擎 ---
+array<float> rz=array.from(wr(fl),wr(sl),wr(ml))
+
+rf=rz.get(F)
+rp=stk(rf,pl)
+
+pr=clp(rf*0.72+rp*0.28,-100.0,0.0)
+pz=sm(pr,ps)
+
+// --- Z-Trend 引擎 ---
+fw=math.max(0.0,1.0-sw-mw)
+array<float> twt=array.from(fw,sw,mw)
+
+cn=con(rz,twt)
+ag=agr(rz)
+ef=nz(eff(sl),0.0)
+
+ud:=cn>-30.0?math.min(1.0,nz(ud[1])*0.93+0.07):nz(ud[1])*0.94
+dd:=cn<-70.0?math.min(1.0,nz(dd[1])*0.93+0.07):nz(dd[1])*0.94
+
+tg0=clp(cn+db*(ud-dd),-100.0,0.0)
+tg=sm(tg0,2)
+
+ba=2.0/(ts+1.0)
+pa=na(tz[1])?ba:alpha(tz[1],tg,rz.get(M),ag,ef,ba,th)
+
+tz:=na(tz[1])?tg:clp(tz[1]+pa*(tg-tz[1]),-100.0,0.0)
+
+// --- 信号: Z-Pulse / Z-Trend 顺势交叉 ---
+xup=ta.crossover(pz,tz)
+xdn=ta.crossunder(pz,tz)
+
+// --- 多空条件 (框架只关心这两个 bool) ---
+longSignal  = xup
+shortSignal = xdn
+
+// =============================================================================
+// 以下为通用框架, 一般不需要修改
+// =============================================================================
+
+// ================= 公共指标 =================
+emaForPullback = ta.ema(close, pullbackEMALen)
+atrValue       = ta.atr(atrLength)
+
+// --- 主图信号带: 把振荡值映射到价格下方窄带 (不影响K线比例) ---
+zAnchorLo = ta.lowest(low, zBandAnchorLB) - zBandGapAtr * atrValue
+zBandH    = zBandAtrMult * atrValue
+mapZ(float v) => zAnchorLo + (v + 100.0) / 100.0 * zBandH
+pzMapped = mapZ(pz)
+tzMapped = mapZ(tz)
+
+formatPrice(float price) => str.tostring(price, format.mintick)
+
+// ================= 状态变量 =================
+var int   tradeCountToday      = 0
+var bool  pendingLong          = false
+var bool  pendingShort         = false
+var int   barIndexOfSetupLong  = na
+var int   barIndexOfSetupShort = na
+var float entryAtr             = na
+
+// ================= 每日状态重置 =================
+newDay = ta.change(time("D")) != 0
+if newDay
+    tradeCountToday      := 0
+    pendingLong          := false
+    pendingShort         := false
+    barIndexOfSetupLong  := na
+    barIndexOfSetupShort := na
+
+// ================= 交易时段 =================
+inSession    = not na(time(timeframe.period, MARKET_SESSION))
+tradeSession = not na(time(timeframe.period, tradeSessionInput))
+
+// 强制平仓: 到达指定整点后触发一次
+pastForceClose = hour >= forceCloseHourInput
+forceClose     = pastForceClose and not pastForceClose[1]
+
+// ================= 信号 + 通用过滤 =================
+dailyLimitOK = maxTradesPerDay == 0 or tradeCountToday < maxTradesPerDay
+flatPosition = strategy.position_size == 0
+
+longSignalFiltered =
+     dailyLimitOK and
+     flatPosition and
+     not pendingLong and
+     tradeSession and
+     inSession and
+     longSignal
+
+shortSignalFiltered =
+     dailyLimitOK and
+     flatPosition and
+     not pendingShort and
+     tradeSession and
+     inSession and
+     shortSignal
+
+newLongSetup        = usePullbackEntry and longSignalFiltered
+newShortSetup       = usePullbackEntry and shortSignalFiltered
+newLongDirectEntry  = not usePullbackEntry and longSignalFiltered
+newShortDirectEntry = not usePullbackEntry and shortSignalFiltered
+
+// ================= 直接入场模式 =================
+if not usePullbackEntry and longSignalFiltered
+    strategy.entry(LONG_ENTRY_ID, strategy.long)
+    tradeCountToday += 1
+
+if not usePullbackEntry and shortSignalFiltered
+    strategy.entry(SHORT_ENTRY_ID, strategy.short)
+    tradeCountToday += 1
+
+// ================= 回调入场模式 =================
+if usePullbackEntry and longSignalFiltered
+    pendingLong := true
+    barIndexOfSetupLong := bar_index
+
+if usePullbackEntry and shortSignalFiltered
+    pendingShort := true
+    barIndexOfSetupShort := bar_index
+
+longPullbackTouch  = ta.crossunder(close, emaForPullback)
+shortPullbackTouch = ta.crossover(close, emaForPullback)
+
+longPullbackEntry =
+     usePullbackEntry and
+     pendingLong and
+     dailyLimitOK and
+     flatPosition and
+     inSession and
+     longPullbackTouch
+
+shortPullbackEntry =
+     usePullbackEntry and
+     pendingShort and
+     dailyLimitOK and
+     flatPosition and
+     inSession and
+     shortPullbackTouch
+
+if longPullbackEntry
+    strategy.entry(LONG_ENTRY_ID, strategy.long)
+    tradeCountToday += 1
+    pendingLong := false
+
+if shortPullbackEntry
+    strategy.entry(SHORT_ENTRY_ID, strategy.short)
+    tradeCountToday += 1
+    pendingShort := false
+
+// 放弃挂单: 信号时段结束 / 等待超时
+if pendingLong and (not tradeSession or (maxPullbackBars > 0 and bar_index - barIndexOfSetupLong > maxPullbackBars))
+    pendingLong := false
+    barIndexOfSetupLong := na
+
+if pendingShort and (not tradeSession or (maxPullbackBars > 0 and bar_index - barIndexOfSetupShort > maxPullbackBars))
+    pendingShort := false
+    barIndexOfSetupShort := na
+
+// ================= 止损止盈 =================
+// 记录开仓当根的 ATR，保证 ATR 止损止盈在持仓期间固定不漂移
+posJustOpened = strategy.position_size != 0 and strategy.position_size[1] == 0
+if posJustOpened
+    entryAtr := atrValue
+
+longTakeProfitPrice  = strategy.position_size > 0 ? strategy.position_avg_price + atrTakeProfitMult * entryAtr : na
+longStopLossPrice    = strategy.position_size > 0 ? strategy.position_avg_price - atrStopLossMult * entryAtr : na
+shortTakeProfitPrice = strategy.position_size < 0 ? strategy.position_avg_price - atrTakeProfitMult * entryAtr : na
+shortStopLossPrice   = strategy.position_size < 0 ? strategy.position_avg_price + atrStopLossMult * entryAtr : na
+
+if strategy.position_size > 0
+    strategy.exit(LONG_EXIT_ID, from_entry=LONG_ENTRY_ID, stop=longStopLossPrice, limit=longTakeProfitPrice)
+
+if strategy.position_size < 0
+    strategy.exit(SHORT_EXIT_ID, from_entry=SHORT_ENTRY_ID, stop=shortStopLossPrice, limit=shortTakeProfitPrice)
+
+// ================= 强制平仓 (日内不留仓) =================
+if forceClose
+    strategy.close_all(comment="强制平仓")
+    pendingLong := false
+    pendingShort := false
+
+// ================= 警报 =================
+alertcondition(newLongSetup or newLongDirectEntry or longPullbackEntry, "开多", "ZTP 策略开多仓")
+alertcondition(newShortSetup or newShortDirectEntry or shortPullbackEntry, "开空", "ZTP 策略开空仓")
+alertcondition(xup, "Z多头交叉", "Z-Pulse 上穿 Z-Trend")
+alertcondition(xdn, "Z空头交叉", "Z-Pulse 下穿 Z-Trend")
+
+// =============================================================================
+// ★ 绘图层 (LuxAlgo 风格)
+// =============================================================================
+
+// --- 多空趋势方向 ---
+bullTrend = pz >= tz
+
+// --- 趋势背景着色 ---
+bgcolor(show_trend_bg and inSession ? (bullTrend ? color.new(BULL_COLOR, 94) : color.new(BEAR_COLOR, 94)) : na, title="Trend Background")
+
+// --- 可选: K线染色 (关闭时用全透明色, 不影响原K线) ---
+candleCss = color_candles ? (bullTrend ? BULL_COLOR : BEAR_COLOR) : color.new(color.white, 100)
+plotcandle(open, high, low, close, title="Trend Candles",
+     color=candleCss, wickcolor=candleCss, bordercolor=candleCss, editable=false)
+
+// --- 回调 EMA (预约信号的回踩基准线) ---
+plot(show_pullback_ema ? emaForPullback : na, "Pullback EMA", color=color.new(#ff9800, 0), linewidth=2)
+
+// --- 信号标签: 淡色 Setup 提示 + 醒目入场标签 ---
+if show_signals and newLongSetup
+    label.new(bar_index, low, "Setup ◆", yloc=yloc.belowbar, style=label.style_label_up,
+         color=color.new(BULL_COLOR, 85), textcolor=color.new(BULL_COLOR, 5), size=size.tiny)
+
+if show_signals and newShortSetup
+    label.new(bar_index, high, "Setup ◆", yloc=yloc.abovebar, style=label.style_label_down,
+         color=color.new(BEAR_COLOR, 85), textcolor=color.new(BEAR_COLOR, 5), size=size.tiny)
+
+longEntrySignal  = newLongDirectEntry or longPullbackEntry
+shortEntrySignal = newShortDirectEntry or shortPullbackEntry
+
+if show_signals and longEntrySignal
+    label.new(bar_index, low, "▲ LONG", yloc=yloc.belowbar, style=label.style_label_up,
+         color=color.new(BULL_COLOR, 12), textcolor=color.white, size=size.small)
+
+if show_signals and shortEntrySignal
+    label.new(bar_index, high, "▼ SHORT", yloc=yloc.abovebar, style=label.style_label_down,
+         color=color.new(BEAR_COLOR, 12), textcolor=color.white, size=size.small)
+
+// --- 主图信号带: Z-Pulse / Z-Trend (映射到价格下方窄带) ---
+pPzMap = plot(show_zband ? pzMapped : na, "Z-Pulse (主图)", color=PULSE_COLOR, linewidth=2)
+pTzMap = plot(show_zband ? tzMapped : na, "Z-Trend (主图)", color=color.new(NEUTRAL_COLOR, 0), linewidth=1)
+
+zTop = math.max(pzMapped, tzMapped)
+zBot = math.min(pzMapped, tzMapped)
+zTopCss = bullTrend ? color.new(BULL_COLOR, 62) : color.new(BEAR_COLOR, 62)
+zBotCss = bullTrend ? color.new(BULL_COLOR, 93) : color.new(BEAR_COLOR, 93)
+fill(pPzMap, pTzMap, zTop, zBot, show_zband ? zTopCss : TRANSP, show_zband ? zBotCss : TRANSP, title="Z Band")
+
+if show_zband and xup
+    label.new(bar_index, pzMapped, "金叉", style=label.style_label_up, color=TRANSP, textcolor=BULL_COLOR, size=size.tiny)
+
+if show_zband and xdn
+    label.new(bar_index, pzMapped, "死叉", style=label.style_label_down, color=TRANSP, textcolor=BEAR_COLOR, size=size.tiny)
+
+// --- 持仓: 止盈/止损渐变区 + 价格线 ---
+inPos   = strategy.position_size != 0
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+
+entryVal = inPos ? strategy.position_avg_price : na
+tpVal    = isLong ? longTakeProfitPrice : isShort ? shortTakeProfitPrice : na
+slVal    = isLong ? longStopLossPrice : isShort ? shortStopLossPrice : na
+
+pEntry = plot(entryVal, "Entry", color=color.new(NEUTRAL_COLOR, 15), style=plot.style_linebr, linewidth=1)
+pTp    = plot(tpVal,    "TP",    color=color.new(BULL_COLOR, 0),    style=plot.style_linebr, linewidth=2)
+pSl    = plot(slVal,    "SL",    color=color.new(BEAR_COLOR, 0),    style=plot.style_linebr, linewidth=2)
+
+// 渐变填充: 越靠近入场越透明, 越靠近目标越实
+tpTop = math.max(entryVal, tpVal)
+tpBot = math.min(entryVal, tpVal)
+slTop = math.max(entryVal, slVal)
+slBot = math.min(entryVal, slVal)
+
+tpTopCss = isLong ? color.new(BULL_COLOR, 68) : color.new(BULL_COLOR, 94)
+tpBotCss = isLong ? color.new(BULL_COLOR, 94) : color.new(BULL_COLOR, 68)
+slTopCss = isLong ? color.new(BEAR_COLOR, 94) : color.new(BEAR_COLOR, 68)
+slBotCss = isLong ? color.new(BEAR_COLOR, 68) : color.new(BEAR_COLOR, 94)
+
+fill(pEntry, pTp, tpTop, tpBot, show_zones ? tpTopCss : TRANSP, show_zones ? tpBotCss : TRANSP, title="TP Zone")
+fill(pEntry, pSl, slTop, slBot, show_zones ? slTopCss : TRANSP, show_zones ? slBotCss : TRANSP, title="SL Zone")
+
+// --- 右端价格标签 (药丸背景 + 百分比) ---
+pctStr(float basePrice, float targetPrice) => str.tostring(math.abs(targetPrice - basePrice) / basePrice * 100, "#.##") + "%"
+
+var label entryLbl = na
+var label tpLbl    = na
+var label slLbl    = na
+
+if inPos and posJustOpened and show_price_labels
+    entryLbl := label.new(bar_index, entryVal, "ENTRY  " + formatPrice(entryVal), style=label.style_label_left, color=color.new(NEUTRAL_COLOR, 20), textcolor=color.white, size=size.small)
+    tpLbl    := label.new(bar_index, tpVal, "TP  " + formatPrice(tpVal) + "  (" + pctStr(entryVal, tpVal) + ")", style=label.style_label_left, color=color.new(BULL_COLOR, 20), textcolor=color.white, size=size.small)
+    slLbl    := label.new(bar_index, slVal, "SL  " + formatPrice(slVal) + "  (" + pctStr(entryVal, slVal) + ")", style=label.style_label_left, color=color.new(BEAR_COLOR, 20), textcolor=color.white, size=size.small)
+
+if inPos and not posJustOpened and not na(entryLbl)
+    label.set_x(entryLbl, bar_index)
+    label.set_x(tpLbl, bar_index)
+    label.set_x(slLbl, bar_index)
+
+if not inPos and not na(entryLbl)
+    label.delete(entryLbl)
+    label.delete(tpLbl)
+    label.delete(slLbl)
+    entryLbl := na
+    tpLbl    := na
+    slLbl    := na
+
+// --- 平仓标签 (含盈亏%) ---
+var float lastEntry   = na
+var float lastTp      = na
+var float lastSl      = na
+var bool  lastWasLong = false
+
+if inPos
+    lastEntry   := strategy.position_avg_price
+    lastTp      := isLong ? longTakeProfitPrice : shortTakeProfitPrice
+    lastSl      := isLong ? longStopLossPrice : shortStopLossPrice
+    lastWasLong := isLong
+
+posJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+if show_exit_labels and posJustClosed and not na(lastEntry)
+    idx    = strategy.closedtrades - 1
+    exitP  = strategy.closedtrades.exit_price(idx)
+    pnl    = lastWasLong ? (exitP - lastEntry) / lastEntry * 100 : (lastEntry - exitP) / lastEntry * 100
+    reason = lastWasLong ? (exitP >= lastTp - syminfo.mintick ? "TP" : exitP <= lastSl + syminfo.mintick ? "SL" : "EXIT") : (exitP <= lastTp + syminfo.mintick ? "TP" : exitP >= lastSl - syminfo.mintick ? "SL" : "EXIT")
+    win    = pnl >= 0
+    xCss   = win ? BULL_COLOR : BEAR_COLOR
+    label.new(bar_index, exitP, "✕ " + reason + "  " + (win ? "+" : "") + str.tostring(pnl, "#.##") + "%", style=label.style_label_left, color=color.new(xCss, 20), textcolor=color.white, size=size.small)
+
+// --- 状态面板 ---
+var table statusTable = table.new(position.top_right, 2, 7, border_width=1, frame_color=color.new(NEUTRAL_COLOR, 30), border_color=color.new(NEUTRAL_COLOR, 70))
+if show_status_table and barstate.islast
+    posTxt   = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    posCss   = strategy.position_size > 0 ? BULL_COLOR : strategy.position_size < 0 ? BEAR_COLOR : NEUTRAL_COLOR
+    entryTxt = inPos ? formatPrice(strategy.position_avg_price) : "—"
+    tpTxt    = isLong ? formatPrice(longTakeProfitPrice) : isShort ? formatPrice(shortTakeProfitPrice) : "—"
+    slTxt    = isLong ? formatPrice(longStopLossPrice) : isShort ? formatPrice(shortStopLossPrice) : "—"
+    trendTxt = bullTrend ? "Bull ▲" : "Bear ▼"
+    trendCss = bullTrend ? BULL_COLOR : BEAR_COLOR
+    hdrBg    = color.new(#2a2e39, 0)
+    rowA     = color.new(NEUTRAL_COLOR, 88)
+    rowB     = color.new(NEUTRAL_COLOR, 82)
+
+    table.cell(statusTable, 0, 0, "ZTP-S", text_color=color.white, bgcolor=hdrBg, text_size=size.small)
+    table.cell(statusTable, 1, 0, "CROSS", text_color=color.new(BULL_COLOR, 0), bgcolor=hdrBg, text_size=size.small)
+    table.cell(statusTable, 0, 1, "Position", text_color=NEUTRAL_COLOR, bgcolor=rowA, text_size=size.small)
+    table.cell(statusTable, 1, 1, posTxt, text_color=posCss, bgcolor=rowA, text_size=size.small)
+    table.cell(statusTable, 0, 2, "Entry", text_color=NEUTRAL_COLOR, bgcolor=rowB, text_size=size.small)
+    table.cell(statusTable, 1, 2, entryTxt, text_color=color.white, bgcolor=rowB, text_size=size.small)
+    table.cell(statusTable, 0, 3, "TP", text_color=NEUTRAL_COLOR, bgcolor=rowA, text_size=size.small)
+    table.cell(statusTable, 1, 3, tpTxt, text_color=BULL_COLOR, bgcolor=rowA, text_size=size.small)
+    table.cell(statusTable, 0, 4, "SL", text_color=NEUTRAL_COLOR, bgcolor=rowB, text_size=size.small)
+    table.cell(statusTable, 1, 4, slTxt, text_color=BEAR_COLOR, bgcolor=rowB, text_size=size.small)
+    table.cell(statusTable, 0, 5, "Trend", text_color=NEUTRAL_COLOR, bgcolor=rowA, text_size=size.small)
+    table.cell(statusTable, 1, 5, trendTxt, text_color=trendCss, bgcolor=rowA, text_size=size.small)
+    table.cell(statusTable, 0, 6, "Trades", text_color=NEUTRAL_COLOR, bgcolor=rowB, text_size=size.small)
+    table.cell(statusTable, 1, 6, str.tostring(tradeCountToday) + " / " + (maxTradesPerDay == 0 ? "∞" : str.tostring(maxTradesPerDay)), text_color=color.white, bgcolor=rowB, text_size=size.small)

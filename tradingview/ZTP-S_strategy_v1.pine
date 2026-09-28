@@ -38,19 +38,19 @@ allowShort = input.bool(true, "允许做空", group="方向")
 
 tradeSessionInput      = input.session("0930-1230", "信号发生时段", group="交易时段")
 pullbackSessionInput   = input.session("0930-1230", "回调入场时段", group="交易时段")
-forceCloseSessionInput = input.session("1545-1600", "强制平仓时段", group="交易时段")
+forceCloseSessionInput = input.session("1400-1600", "强制平仓时段", group="交易时段")
 
 maxTradesPerDay = input.int(2, "每日最大交易次数", minval=0, maxval=20, tooltip="0 表示不限制", group="交易频率")
 
 usePullbackEntry = input.bool(true, "使用回调入场", group="回调入场", tooltip="开启后信号出现不直接入场，等价格回踩均线再顺势入场")
 pullbackEMALen   = input.int(12, "回调 EMA 周期", minval=1, group="回调入场")
-maxPullbackBars  = input.int(9, "回调等待最大K线数", minval=0, group="回调入场", tooltip="超过该根数未回踩则放弃信号，0 表示不限制")
+maxPullbackBars  = input.int(8, "回调等待最大K线数", minval=0, group="回调入场", tooltip="超过该根数未回踩则放弃信号，0 表示不限制")
 
 tpSlMode            = input.string("ATR", "止盈止损方式", options=["百分比", "ATR"], group="止损止盈")
 take_profit_percent = input.float(0.5, "止盈 (%)", step=0.05, minval=0.01, group="止损止盈")
 stop_loss_percent   = input.float(0.25, "止损 (%)", step=0.05, minval=0.01, group="止损止盈")
 atrLength           = input.int(14, "ATR 周期", minval=1, group="止损止盈")
-atrTakeProfitMult   = input.float(4.2, "ATR 止盈倍数", step=0.1, minval=0.1, group="止损止盈")
+atrTakeProfitMult   = input.float(4, "ATR 止盈倍数", step=0.1, minval=0.1, group="止损止盈")
 atrStopLossMult     = input.float(1.5, "ATR 止损倍数", step=0.1, minval=0.1, group="止损止盈")
 
 show_signals = input.bool(true, "显示信号标签", group="可视化")
