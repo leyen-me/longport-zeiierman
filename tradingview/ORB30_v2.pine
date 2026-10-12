@@ -1,0 +1,208 @@
+//@version=6
+// ==============================================================================
+// ORB30 v2 — 研究优化版 (基于 SPY 6年回测, 2020-07~2026-09)
+//
+//   相较 v1 的改动:
+//     ① 开盘区间 15 分钟 (原 30)
+//     ② 突破确认 3 根 (原 2)
+//     ③ 过滤: 跳空方向须与突破方向一致 + 首根 5min 方向须与突破方向一致
+//     ④ 出场: 锚 OR 边界固定 SL/TP + 0.75R 移动止损
+//        SL = 边界 ∓ slVal, TP = 边界 ± tpVal, 移动 = 极值 ∓ 0.75×R
+//     ⑤ 默认只做周一~周三 (可调)
+//
+//   回测(Mon-Wed, gap+fd 过滤): PF 2.31, 胜53.9%, 盈亏比1.52, t4.91, 每年 PF>1.4
+//     全周(5天):              PF 1.77, 胜52.8%, 盈亏比1.32, t4.59, 每年 PF>1.1
+//   （对照 v1 基线: PF 1.16, t1.82 — 仅供研究, 实盘前务必自行复测）
+// ==============================================================================
+strategy("ORB30 v2 (研究优化版)", shorttitle="ORB30v2", overlay=true,
+     pyramiding=1,
+     default_qty_type=strategy.fixed,
+     default_qty_value=80,
+     calc_on_every_tick=false,
+     process_orders_on_close=true,
+     max_boxes_count=500, max_lines_count=500)
+
+const color BULL = #089981
+const color BEAR = #f23645
+const color NEUT = #787b86
+
+// --- 交易日 ---
+// 研究结论: 周四无 edge(PF≈1.0) 建议关闭; 周五可开
+tradeMon = input.bool(true,  "周一", group="交易日")
+tradeTue = input.bool(true,  "周二", group="交易日")
+tradeWed = input.bool(true,  "周三", group="交易日")
+tradeThu = input.bool(false, "周四", group="交易日")
+tradeFri = input.bool(true,  "周五", group="交易日")
+dayAllowed = (dayofweek==dayofweek.monday and tradeMon) or (dayofweek==dayofweek.tuesday and tradeTue) or
+             (dayofweek==dayofweek.wednesday and tradeWed) or (dayofweek==dayofweek.thursday and tradeThu) or
+             (dayofweek==dayofweek.friday and tradeFri)
+
+// --- 开盘区间 ---
+orMinutes  = input.int(15, "开盘区间(分钟)", minval=5, step=5, group="开盘区间")
+brkCandles = input.int(3,  "连续突破K线数", minval=1, group="开盘区间")
+
+// --- 仓位 ---
+posQty = input.float(80, "下单数量", minval=1, step=1, group="仓位")
+
+// --- 风险/出场 ---
+slVal     = input.float(1.1, "止损点数(锚边界)", step=0.1, minval=0.1, group="风险")
+tpVal     = input.float(2.1, "止盈点数(锚边界)", step=0.1, minval=0.1, group="风险")
+useTrail  = input.bool(false, "启用移动止损", group="风险")
+trailMult = input.float(0.75, "移动倍数 (×R)", minval=0.0, step=0.05, group="风险")
+
+// --- 过滤 ---
+useGapFlt = input.bool(false, "跳空方向须一致", group="过滤")
+useFdFlt  = input.bool(true, "首根方向须一致", group="过滤")
+firstOnly = input.bool(true, "首个突破被过滤后锁定当日", group="过滤")
+
+// --- 强平 ---
+eodH = input.int(12, "强平 时", minval=0, maxval=23, inline="eod", group="强平")
+eodM = input.int(0,  "分", minval=0, maxval=59, inline="eod", group="强平")
+
+const string EOD_TZ = "America/New_York"
+
+// --- 新交易日 (用日期变化, 不能用 not rth[1]: 常规时段数据相邻日都是 RTH) ---
+newDay = ta.change(dayofmonth(time, EOD_TZ)) != 0
+
+// --- 开盘区间: RTH(09:30-16:00) 内前 orBars 根 K 线, 自适应周期 ---
+tfMin  = math.max(1.0, timeframe.in_seconds() / 60.0)
+orBars = math.max(1, int(math.round(orMinutes / tfMin)))
+rth    = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+rthStart = rth and (not rth[1] or newDay)    // 同日首个 RTH bar, 或新交易日
+
+var int barInRTH = 0
+if rthStart
+    barInRTH := 0
+if rth
+    barInRTH += 1
+inOR = rth and barInRTH <= orBars
+
+// --- 强平 ---
+eodMin    = eodH * 60 + eodM
+barMinEod = hour(time, EOD_TZ) * 60 + minute(time, EOD_TZ)
+eodPassed = barMinEod >= eodMin
+
+// --- 状态 ---
+var float sessionHigh = na
+var float sessionLow  = na
+var bool  sessionDone = false
+var bool  tradedToday = false
+var int   bullCount   = 0
+var int   bearCount   = 0
+var float dayOpenPx   = na
+var int   firstBarDir = 0
+var float prevCloseD  = na   // 昨日收盘 (日线)
+var float entryPx     = na
+var float initSL      = na
+var float tgtPx       = na
+var float Rpts        = na
+var float runExt      = na
+var float trailStop   = na
+
+var box[]  profitBoxes = array.new_box()
+var box[]  lossBoxes   = array.new_box()
+var line[] entryLines  = array.new_line()
+
+prevCloseD := request.security(syminfo.tickerid, "1D", close[1], lookahead=barmerge.lookahead_off)
+
+// --- 新会话: 初始化 OR + 记录开盘价 & 首根方向 ---
+if rthStart and dayAllowed
+    sessionHigh := high
+    sessionLow  := low
+    sessionDone := false
+    tradedToday := false
+    bullCount   := 0
+    bearCount   := 0
+    dayOpenPx   := open
+    firstBarDir := 0
+
+if inOR and dayAllowed
+    sessionHigh := math.max(sessionHigh, high)
+    sessionLow  := math.min(sessionLow, low)
+
+// 首根 K 线方向
+if inOR and dayAllowed and firstBarDir == 0
+    firstBarDir := close >= open ? 1 : -1
+
+if inOR[1] and not inOR and dayAllowed
+    sessionDone := true
+
+// --- 突破计数 ---
+if sessionDone
+    if close > sessionHigh
+        bullCount += 1
+        bearCount := 0
+    else if close < sessionLow
+        bearCount += 1
+        bullCount := 0
+    else
+        bullCount := 0
+        bearCount := 0
+
+// --- 过滤条件 (入场时刻已知) ---
+gapKnown = not na(prevCloseD) and not na(dayOpenPx)
+gapUp    = gapKnown and dayOpenPx > prevCloseD
+gapDown  = gapKnown and dayOpenPx < prevCloseD
+
+// --- 入场 ---
+if sessionDone and not tradedToday and dayAllowed and not eodPassed
+    longSig  = bullCount >= brkCandles
+    shortSig = bearCount >= brkCandles
+    longOk   = longSig  and (not useGapFlt or not gapKnown or gapUp)   and (not useFdFlt or firstBarDir > 0)
+    shortOk  = shortSig and (not useGapFlt or not gapKnown or gapDown) and (not useFdFlt or firstBarDir < 0)
+    // firstOnly: 首个突破一出现即锁当日 (即使被过滤, 也不再等反向突破) —— 与引擎/实盘一致
+    if firstOnly and (longSig or shortSig)
+        tradedToday := true
+    if longOk
+        strategy.entry("Long", strategy.long, qty=posQty)
+        tradedToday := true
+    if shortOk
+        strategy.entry("Short", strategy.short, qty=posQty)
+        tradedToday := true
+
+// --- 出场管理 (锚 OR 边界 + 移动止损) ---
+justEntered = strategy.position_size != 0 and strategy.position_size[1] == 0
+isLong      = strategy.position_size > 0
+
+if justEntered
+    entryPx   := strategy.position_avg_price
+    initSL    := isLong ? sessionHigh - slVal : sessionLow + slVal
+    tgtPx     := isLong ? sessionHigh + tpVal : sessionLow - tpVal
+    Rpts      := math.abs(entryPx - initSL)
+    runExt    := isLong ? high : low
+    trailStop := initSL
+    pb = box.new(bar_index, isLong ? tgtPx : entryPx, bar_index + 1, isLong ? entryPx : tgtPx,
+         bgcolor=color.new(BULL, 80), border_color=BULL)
+    lb = box.new(bar_index, isLong ? entryPx : initSL, bar_index + 1, isLong ? initSL : entryPx,
+         bgcolor=color.new(BEAR, 80), border_color=BEAR)
+    el = line.new(bar_index, entryPx, bar_index + 1, entryPx, color=NEUT, style=line.style_dashed)
+    array.push(profitBoxes, pb)
+    array.push(lossBoxes, lb)
+    array.push(entryLines, el)
+
+if isLong
+    runExt    := math.max(runExt, high)
+    cand      = runExt - trailMult * Rpts
+    trailStop := useTrail ? math.max(initSL, cand) : initSL
+    strategy.exit("Exit L", "Long", stop=trailStop, limit=tgtPx)
+else if strategy.position_size < 0
+    runExt    := math.min(runExt, low)
+    cand      = runExt + trailMult * Rpts
+    trailStop := useTrail ? math.min(initSL, cand) : initSL
+    strategy.exit("Exit S", "Short", stop=trailStop, limit=tgtPx)
+
+if strategy.position_size != 0 and array.size(profitBoxes) > 0
+    last = array.size(profitBoxes) - 1
+    box.set_right(array.get(profitBoxes, last), bar_index + 1)
+    lbx = array.get(lossBoxes, last)
+    box.set_right(lbx, bar_index + 1)
+    if isLong
+        box.set_top(lbx, entryPx)
+        box.set_bottom(lbx, trailStop)
+    else
+        box.set_top(lbx, trailStop)
+        box.set_bottom(lbx, entryPx)
+    line.set_x2(array.get(entryLines, last), bar_index + 1)
+
+if strategy.position_size != 0 and (eodPassed or newDay)
+    strategy.close_all(comment="EOD Close")

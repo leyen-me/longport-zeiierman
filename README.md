@@ -1,12 +1,18 @@
-# ZTP — Zeiierman Trend Pressure 策略复刻与 0DTE 期权实盘
+# Zeiierman 日内策略复刻 + 长桥 0DTE 期权实盘
 
-将 TradingView 上的 [Zeiierman Trend Pressure] 日内策略逐字节复刻为 Python：
+把 TradingView 日内策略逐字节复刻为 Python，并通过长桥 OpenAPI（websocket 推送驱动）交易 SPY 0DTE 期权。仓库含两套策略：
 
-1. **回测引擎**：精确复刻 TradingView 策略测试器的撮合语义（`process_orders_on_close`、tick 取整、盘中 stop/limit 路径假设、回调入场超时等）
-2. **实盘执行**：通过长桥 OpenAPI（websocket 推送驱动）交易 SPY 0DTE 期权
+1. **ZTP**（Zeiierman Trend Pressure）— 见下
+2. **ORB30 v2**（开盘区间突破，当前生产版）— 见「ORB30 v2」章节
 
 > ⚠️ 免责声明：本项目仅供学习研究，不构成投资建议。期权交易风险极高，0DTE 尤甚。
 > 原始指标 © [Zeiierman](https://www.zeiierman.com/)（CC BY-NC-SA 4.0），本项目为其个人用途复刻。
+
+## 生产状态
+
+- **当前实盘策略：ORB30 v2**（引擎 `ztp/orb.py` / 实盘 `ztp/orb_live.py` / Pine `tradingview/ORB30_v2.pine`，三处一致）
+- 已对齐：本地方向引擎 ↔ 实盘状态机（`tests/test_orb_live_consistency.py`），且与 TradingView 导出的成交**逐笔吻合**（入场价一致到分）
+- 参数被 `tests/test_orb_config.py` 锁定，误改即测试失败
 
 ---
 
@@ -25,24 +31,65 @@
 ## 目录结构
 
 ```
-├── src布局见 ztp/            # 核心包
-│   ├── config.py             # 策略参数（与 Pine 脚本一一对应）
-│   ├── tvfuncs.py            # TradingView 内置函数精确复刻
-│   ├── signals.py            # Z-Pulse / Z-Trend / 压力衰竭引擎
-│   ├── engine.py             # TV 撮合语义回测引擎
-│   ├── live.py               # 实时决策状态机（与回测同逻辑）
+├── ztp/                      # 核心包
+│   ├── orb.py                # ★ ORB30 v2 回测引擎 (与 Pine 同语义)
+│   ├── orb_live.py           # ★ ORB30 v2 实盘决策状态机
+│   ├── orb_runner.py         # ★ ORB 实盘主循环 (推送驱动)
 │   ├── options.py            # 0DTE 期权链/delta/选档/预算规则
-│   ├── runner.py             # 实盘主循环（推送驱动）
 │   ├── longport_data.py      # 长桥行情下载与缓存
-│   ├── logging.py            # ET 时区日志
-│   └── paths.py              # 数据/结果目录（环境变量可覆盖）
+│   ├── config.py / engine.py / live.py / runner.py / signals.py / tvfuncs.py
+│   │                         # ZTP 策略 (另一套)
+│   ├── logging.py / mailer.py / paths.py
 ├── scripts/                  # 回测/比对/实盘入口
-├── tests/                    # 一致性测试
-├── tradingview/              # Pine 脚本（原策略 + 调试指标）
+│   ├── run_orb.py            # ORB v2 回测
+│   ├── orb_live.py           # ORB v2 实盘入口 (dry-run 支持)
+│   ├── compare_orb.py        # 与 TV 成交明细逐笔比对
+│   ├── live_run.py / run_backtest.py / compare_tv.py   # ZTP 入口
+├── research/                 # 研究脚本 (非生产, 见 research/README.md)
+├── tests/                    # 单元测试 (见下)
+├── tradingview/              # Pine 脚本 (ORB30_v2.pine 为生产版本)
 ├── data/reference/           # TradingView 导出的参考数据
-├── data_cache/               # K线缓存（parquet，运行时生成）
-└── results/                  # 日志/成交/状态（运行时生成）
+├── data_cache/               # K线缓存 (parquet, 运行时生成, gitignore)
+└── results/                  # 日志/成交/状态 (运行时生成, gitignore)
 ```
+
+## ORB30 v2（当前生产策略）
+
+**逻辑**：开盘区间 15 分钟 → 连续 3 根 5min 收盘突破 → 顺势入场（收盘价成交）
+→ 固定止损/止盈（锚 OR 边界 ∓1.1 / ±2.1）→ 美东 12:00 强平；每日最多 1 笔。
+**过滤**：跳空方向过滤（关）、首根方向过滤（开）、首个突破锁定当日（开）、移动止损（关）。
+交易日周一/二/三/五（周四无 edge）。
+
+参数集中在 `ztp/orb.py:ORBConfig`，并由 `tests/test_orb_config.py` 锁定。
+
+```bash
+# 回测 (本地缓存 5min)
+.venv/bin/python scripts/run_orb.py --symbol SPY.US --out results/orb_trades.csv
+# 与 TradingView 成交明细逐笔比对
+.venv/bin/python scripts/compare_orb.py --tv data/reference/ORB30_AMEX_SPY_2026-10-12.csv --ours results/orb_trades.csv
+
+# 实盘 (模拟/真实取决于长桥凭证)
+.venv/bin/python scripts/orb_live.py --dry-run --budget 300   # 只打印信号
+.venv/bin/python scripts/orb_live.py --budget 300             # 真实下单
+# 或: python -m ztp.orb_runner --dry-run
+```
+
+## 测试
+
+无需 pytest，直接用内置 runner（每个测试文件也可单独运行）：
+
+```bash
+.venv/bin/python run_tests.py            # 全部
+.venv/bin/python run_tests.py orb        # 只跑文件名含 orb 的
+```
+
+| 测试 | 内容 |
+|---|---|
+| `test_orb_engine.py` | 引擎语义：OR/突破确认/锚边界/过滤/锁当日/移动止损/EOD/取整 |
+| `test_orb_config.py` | 锁定生产参数（默认可变更即失败） |
+| `test_orb_live_consistency.py` | 状态机逐笔 == 引擎（合成 + 参考数据，含多组参数） |
+| `test_option_sizing.py` | 期权定量规则 |
+| `test_live_consistency.py` | ZTP 状态机 == ZTP 引擎 |
 
 ## 快速开始
 

@@ -50,7 +50,8 @@ def _et_minutes(now: datetime) -> int:
 
 class ORBLiveRunner:
     def __init__(self, dry_run: bool = False, budget: float = 300.0,
-                 target_delta: float = 0.50):
+                 target_delta: float = 0.50, max_contracts: int | None = None,
+                 min_one: bool = True):
         os.environ.setdefault("LONGPORT_PUSH_CANDLESTICK_MODE", "confirmed")
         missing = [
             k for k in ("LONGPORT_APP_KEY", "LONGPORT_APP_SECRET", "LONGPORT_ACCESS_TOKEN")
@@ -66,6 +67,8 @@ class ORBLiveRunner:
         self.dry_run = dry_run
         self.budget = budget
         self.target_delta = target_delta
+        self.max_contracts = max_contracts
+        self.min_one = min_one
         self.openapi = __import__("longport").openapi
         self.qctx = self.openapi.QuoteContext(_config())
         self.tctx = None if dry_run else self.openapi.TradeContext(_config())
@@ -164,6 +167,12 @@ class ORBLiveRunner:
             "entry_px": st.entry_px, "entry_i": st.entry_i,
             "sl_px": st.sl_px if st.sl_px == st.sl_px else None,
             "tp_px": st.tp_px if st.tp_px == st.tp_px else None,
+            "init_sl_px": st.init_sl_px if st.init_sl_px == st.init_sl_px else None,
+            "R": st.R if st.R == st.R else None,
+            "run_ext": st.run_ext if st.run_ext == st.run_ext else None,
+            "day_open": st.day_open if st.day_open == st.day_open else None,
+            "prev_close": st.prev_close if st.prev_close == st.prev_close else None,
+            "first_dir": st.first_dir,
             "exit_armed": st.exit_armed, "exit_from": st.exit_from,
             "option_pos": self.option_pos,
         }
@@ -189,6 +198,12 @@ class ORBLiveRunner:
         st.entry_px, st.entry_i = data["entry_px"], data["entry_i"]
         st.sl_px = data["sl_px"] if data["sl_px"] is not None else float("nan")
         st.tp_px = data["tp_px"] if data["tp_px"] is not None else float("nan")
+        st.init_sl_px = data.get("init_sl_px") if data.get("init_sl_px") is not None else float("nan")
+        st.R = data.get("R") if data.get("R") is not None else float("nan")
+        st.run_ext = data.get("run_ext") if data.get("run_ext") is not None else float("nan")
+        st.day_open = data.get("day_open") if data.get("day_open") is not None else float("nan")
+        st.prev_close = data.get("prev_close") if data.get("prev_close") is not None else float("nan")
+        st.first_dir = data.get("first_dir", 0)
         st.exit_armed, st.exit_from = data["exit_armed"], data["exit_from"]
         self.option_pos = data.get("option_pos")
         if st.pos_dir != 0:
@@ -212,7 +227,7 @@ class ORBLiveRunner:
             pick = pick_option(
                 self.qctx, SYMBOL, is_call, spot,
                 budget=self.budget, target_delta=self.target_delta,
-                use_full_budget=True,
+                use_full_budget=True, max_qty=self.max_contracts, min_one=self.min_one,
             )
             if pick is None:
                 log.warning(f"无满足预算({self.budget})/delta({self.target_delta})的期权, 放弃信号")
@@ -426,7 +441,9 @@ class ORBLiveRunner:
         self.subscribe()
         log.info(
             f"启动完成: dry_run={self.dry_run} 预算={self.budget} "
-            f"目标delta={self.target_delta} OR={self.cfg.or_minutes}min "
+            f"目标delta={self.target_delta} "
+            f"至少1张(不限价){'/最多%s张' % self.max_contracts if self.max_contracts else ''} "
+            f"OR={self.cfg.or_minutes}min "
             f"SL/TP={self.cfg.sl_points}/{self.cfg.tp_points}点 强平={self.cfg.eod_hour}:{self.cfg.eod_minute:02d}"
         )
         self.mailer.send(
@@ -583,5 +600,8 @@ if __name__ == "__main__":
     p.add_argument("--dry-run", action="store_true", help="只打印信号, 不真实下单")
     p.add_argument("--budget", type=float, default=300.0, help="单笔期权预算/最大风险(美元), 默认 300")
     p.add_argument("--delta", type=float, default=0.50, help="目标 delta")
+    p.add_argument("--max-contracts", type=int, default=None,
+                   help="单笔最大张数上限 (小资金防超配, 如 1)")
     a = p.parse_args()
-    ORBLiveRunner(dry_run=a.dry_run, budget=a.budget, target_delta=a.delta).run()
+    ORBLiveRunner(dry_run=a.dry_run, budget=a.budget, target_delta=a.delta,
+                  max_contracts=a.max_contracts).run()

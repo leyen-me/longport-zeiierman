@@ -30,6 +30,13 @@ class ORBLiveState:
     exit_from: int = 1 << 60
     sl_px: float = np.nan
     tp_px: float = np.nan
+    # v2 过滤 + 移动止损
+    day_open: float = np.nan
+    prev_close: float = np.nan
+    first_dir: int = 0
+    init_sl_px: float = np.nan
+    R: float = np.nan
+    run_ext: float = np.nan
     last_date: date | None = None
 
 
@@ -68,6 +75,10 @@ class ORBLiveStrategy:
     def _eod_passed(self, m: int) -> bool:
         return m >= self.cfg.eod_hour * 60 + self.cfg.eod_minute
 
+    def _prev_day_close(self, today) -> float:
+        prev = self.df[self.df.index.date < today]
+        return float(prev["close"].iloc[-1]) if len(prev) else float("nan")
+
     # ---------- 重启预热: 从当日已有 bar 重建开盘区间状态 ----------
 
     def prime(self):
@@ -84,6 +95,9 @@ class ORBLiveStrategy:
             if in_sess and not in_sess_prev:
                 st.session_high, st.session_low = r["high"], r["low"]
                 st.session_done, st.traded_today, st.bull, st.bear = False, False, 0, 0
+                st.day_open = float(r["open"])
+                st.first_dir = 1 if r["close"] >= r["open"] else -1
+                st.prev_close = self._prev_day_close(today)
             if in_sess:
                 st.session_high = max(st.session_high, r["high"])
                 st.session_low = min(st.session_low, r["low"])
@@ -96,9 +110,27 @@ class ORBLiveStrategy:
                     st.bear, st.bull = st.bear + 1, 0
                 else:
                     st.bull = st.bear = 0
-                if (st.bull >= self.cfg.brk_candles or st.bear >= self.cfg.brk_candles) \
-                        and ts.dayofweek in self.cfg.trade_days:
-                    st.traded_today = True  # 历史已触发过入场, 不追补
+                long_sig = st.bull >= self.cfg.brk_candles
+                short_sig = st.bear >= self.cfg.brk_candles
+                if ts.dayofweek in self.cfg.trade_days and (long_sig or short_sig):
+                    # 历史已出现突破信号 -> 不追补; first_signal_only 时无论过滤与否都锁当日
+                    if self.cfg.first_signal_only \
+                            or (long_sig and self._filter_ok(1)) \
+                            or (short_sig and self._filter_ok(-1)):
+                        st.traded_today = True
+
+    def _filter_ok(self, direction: int) -> bool:
+        """v2 过滤: 跳空方向 + 首根方向 须与突破方向一致。"""
+        cfg = self.cfg
+        st = self.st
+        gap_known = st.prev_close == st.prev_close
+        if direction > 0:
+            gap_ok = (not cfg.use_gap_filter) or (not gap_known) or st.day_open > st.prev_close
+            fd_ok = (not cfg.use_firstbar_filter) or st.first_dir > 0
+        else:
+            gap_ok = (not cfg.use_gap_filter) or (not gap_known) or st.day_open < st.prev_close
+            fd_ok = (not cfg.use_firstbar_filter) or st.first_dir < 0
+        return gap_ok and fd_ok
 
     # ---------- 外部事件 ----------
 
@@ -129,6 +161,7 @@ class ORBLiveStrategy:
         st = self.st
         i = len(self.df) - 1
         ts = self.df.index[i]
+        o = float(self.df["open"].iloc[i])
         h = float(self.df["high"].iloc[i])
         l = float(self.df["low"].iloc[i])
         c = float(self.df["close"].iloc[i])
@@ -142,10 +175,13 @@ class ORBLiveStrategy:
         day_ok = ts.dayofweek in cfg.trade_days
         eod = self._eod_passed(m)
 
-        # 开盘区间构建
+        # 开盘区间构建 (v2: 记录开盘价/首根方向/昨日收盘)
         if in_sess and not in_sess_prev:
             st.session_high, st.session_low = h, l
             st.session_done, st.traded_today, st.bull, st.bear = False, False, 0, 0
+            st.day_open = o
+            st.first_dir = 1 if c >= o else -1
+            st.prev_close = self._prev_day_close(ts.date())
         if in_sess:
             st.session_high = max(st.session_high, h)
             st.session_low = min(st.session_low, l)
@@ -161,17 +197,33 @@ class ORBLiveStrategy:
             else:
                 st.bull = st.bear = 0
 
-        # 入场
+        # 入场 (v2 过滤 + 当日首个突破锁定)
         if st.pos_dir == 0 and st.session_done and not st.traded_today and day_ok and not eod:
-            if st.bull >= cfg.brk_candles:
-                self._open(1, i, c, st.session_high, actions)
-            elif st.bear >= cfg.brk_candles:
-                self._open(-1, i, c, st.session_low, actions)
+            long_sig = st.bull >= cfg.brk_candles
+            short_sig = st.bear >= cfg.brk_candles
+            if long_sig or short_sig:
+                if cfg.first_signal_only:
+                    st.traded_today = True          # 首个突破出现即锁当日
+                if long_sig and self._filter_ok(1):
+                    self._open(1, i, c, st.session_high, actions)
+                elif short_sig and self._filter_ok(-1):
+                    self._open(-1, i, c, st.session_low, actions)
 
         # 强平
         if st.pos_dir != 0 and eod:
             self.notify_exit_fill(_round_tick(c, cfg.mintick), "EOD")
             actions.append(StrategyAction("eod", c, i))
+
+        # v2 移动止损: 用本根极值移动 (下一根生效)
+        if st.pos_dir != 0 and cfg.use_trail and st.R == st.R:
+            if st.pos_dir > 0:
+                st.run_ext = max(st.run_ext, h)
+                st.sl_px = max(st.init_sl_px,
+                               _round_tick(st.run_ext - cfg.trail_mult * st.R, cfg.mintick))
+            else:
+                st.run_ext = min(st.run_ext, l)
+                st.sl_px = min(st.init_sl_px,
+                               _round_tick(st.run_ext + cfg.trail_mult * st.R, cfg.mintick))
 
         return actions
 
@@ -189,6 +241,10 @@ class ORBLiveStrategy:
         else:
             st.sl_px = _round_tick(anchor + self.cfg.sl_points, self.cfg.mintick)
             st.tp_px = _round_tick(anchor - self.cfg.tp_points, self.cfg.mintick)
+        # v2: 初始止损/风险/极值 (移动止损锚点)
+        st.init_sl_px = st.sl_px
+        st.R = abs(st.entry_px - st.sl_px)
+        st.run_ext = float(self.df["high"].iloc[i]) if direction > 0 else float(self.df["low"].iloc[i])
         st.exit_armed = True
         st.exit_from = i
         actions.append(StrategyAction("enter_long" if direction > 0 else "enter_short", px, i))

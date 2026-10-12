@@ -66,25 +66,36 @@ class OptionPick:
     spot: float
 
 
-def size_contracts(ask: float, budget: float, use_full_budget: bool = False) -> int:
+def size_contracts(ask: float, budget: float, use_full_budget: bool = False,
+                   max_qty: int | None = None, min_one: bool = False) -> int:
     """按预算计算可买张数。
 
     use_full_budget=False (默认, ZTP): 最多 2 张, 2 张超预算则 1 张, 1 张仍超则 0。
-    use_full_budget=True (ORB): 用满预算买尽量多张 (风险=权利金 ≤ budget),
-                               只要 1 张不超过预算就至少买 1 张。
+    use_full_budget=True (ORB): 用满预算买尽量多张 (风险=权利金 ≤ budget)。
+    max_qty: 硬性张数上限 (小资金防超配, 如 1)。
+    min_one: 至少买 1 张, 且第 1 张不受预算限制 (信号来了必开仓)。
+             多张时总成本仍 ≤ budget。
     """
     cost = ask * 100
-    if cost <= 0 or budget <= 0:
+    if cost <= 0:
         return 0
     if use_full_budget:
-        return int(budget // cost)
-    return 2 if 2 * cost <= budget else (1 if cost <= budget else 0)
+        q = int(budget // cost) if budget > 0 else 0
+    else:
+        q = 2 if 2 * cost <= budget else (1 if cost <= budget else 0)
+    if max_qty is not None:
+        q = min(q, max_qty)
+    if min_one:
+        q = max(q, 1)          # 第 1 张不限价
+    return q
 
 
 def pick_option(qctx, underlying: str, is_call: bool, spot: float,
                 budget: float = 200.0, target_delta: float = 0.50,
                 now: datetime | None = None,
-                use_full_budget: bool = False) -> OptionPick | None:
+                use_full_budget: bool = False,
+                max_qty: int | None = None,
+                min_one: bool = False) -> OptionPick | None:
     now = now or datetime.now(ET)
     expiry = pick_expiry(qctx, underlying, now)
     chain = qctx.option_chain_info_by_date(underlying, expiry)
@@ -112,7 +123,7 @@ def pick_option(qctx, underlying: str, is_call: bool, spot: float,
             delta = -delta
         if not (0.25 <= abs(delta) <= 0.75):
             continue
-        qty = size_contracts(ask, budget, use_full_budget)
+        qty = size_contracts(ask, budget, use_full_budget, max_qty, min_one)
         if qty == 0:
             continue
         gap = abs(abs(delta) - target_delta)
