@@ -1,0 +1,181 @@
+//@version=6
+// ==============================================================================
+// ORB30 — 期货开盘区间突破 (Opening Range Breakout)
+//
+//   ① 开盘区间: 纽约时间 09:30 起 orDur 分钟的最高/最低 (默认 30 分钟)
+//   ② 突破确认: 区间结束后, 连续 brkCandles 根 K 线收盘站上高点/跌破低点
+//   ③ 入场:     突破 -> 顺势做多/做空, 每日仅 1 笔
+//   ④ 出场:     固定点数止损 + 固定点数止盈
+//   ⑤ 平仓:     到 eodH:eodM (强平时区) 强制平掉所有仓位, 不留隔夜
+//   ⑥ 可视化:   逐笔止盈/止损方块 + 入场虚线, 持仓期间向右延伸
+// ==============================================================================
+strategy("Enhanced OR Strategy (Futures + Breakeven + TV Position Box – History)",
+     shorttitle="ORB30",
+     overlay=true,
+     pyramiding=10,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=80,
+     calc_on_every_tick=false,
+     process_orders_on_close=true,
+     max_boxes_count=500,
+     max_lines_count=500)
+
+// --- 配色 ---
+const color BULL = #089981
+const color BEAR = #f23645
+const color NEUT = #787b86
+
+// --- 输入: 交易日 ---
+tradeMon = input.bool(true, "周一", group="交易日")
+tradeTue = input.bool(true, "周二", group="交易日")
+tradeWed = input.bool(true, "周三", group="交易日")
+tradeThu = input.bool(false, "周四", group="交易日")
+tradeFri = input.bool(false, "周五", group="交易日")
+
+dayAllowed =
+     (dayofweek == dayofweek.monday    and tradeMon) or
+     (dayofweek == dayofweek.tuesday   and tradeTue) or
+     (dayofweek == dayofweek.wednesday and tradeWed) or
+     (dayofweek == dayofweek.thursday  and tradeThu) or
+     (dayofweek == dayofweek.friday    and tradeFri)
+
+// --- 输入: 开盘区间 ---
+orDur      = input.string("30 分钟", "开盘区间时长",
+     options=["5 分钟","15 分钟","30 分钟","45 分钟","60 分钟"], group="开盘区间")
+brkCandles = input.int(2, "连续突破K线数", minval=1, group="开盘区间")
+
+// --- 输入: 仓位 ---
+posPct = input.float(80, "仓位 %", minval=1, maxval=100, step=1, group="仓位")
+
+// --- 输入: 风险 (固定点数) ---
+slVal = input.float(1.1, "止损点数", step=0.1, minval=0.1, group="风险")
+tpVal = input.float(2.1, "止盈点数", step=0.1, minval=0.1, group="风险")
+
+// --- 输入: 强平 ---
+eodH = input.int(12, "强平 时", minval=0, maxval=23, inline="eod", group="强平")
+eodM = input.int(0, "分", minval=0, maxval=59, inline="eod", group="强平")
+
+// --- 强平时区 (固定, 与开盘区间一致; 如需改动改这里即可) ---
+const string EOD_TZ = "America/New_York"
+
+// --- 开盘区间会话 ---
+sessionEnd =
+     orDur == "5 分钟"  ? "0935" :
+     orDur == "15 分钟" ? "0945" :
+     orDur == "30 分钟" ? "1000" :
+     orDur == "45 分钟" ? "1015" : "1030"
+sessionStr = "0930-" + sessionEnd
+inSession  = not na(time(timeframe.period, sessionStr, "America/New_York"))
+
+// --- 强平时间状态 ---
+eodMin    = eodH * 60 + eodM
+barMinEod = hour(time, EOD_TZ) * 60 + minute(time, EOD_TZ)
+eodPassed = barMinEod >= eodMin
+newDay    = ta.change(dayofmonth(time, EOD_TZ)) != 0
+
+// --- 状态变量 ---
+var float sessionHigh = na
+var float sessionLow  = na
+var bool  sessionDone = false
+var bool  tradedToday = false
+var int   bullCount   = 0
+var int   bearCount   = 0
+
+// --- 历史绘图 ---
+var box[]  profitBoxes = array.new_box()
+var box[]  lossBoxes   = array.new_box()
+var line[] entryLines  = array.new_line()
+
+// --- 止损/止盈 (固定点数) ---
+getStop(entry, isLong) =>
+    isLong ? entry - slVal : entry + slVal
+
+getTp(entry, isLong) =>
+    isLong ? entry + tpVal : entry - tpVal
+
+// --- 构建开盘区间 ---
+if inSession and not inSession[1] and dayAllowed
+    sessionHigh := high
+    sessionLow  := low
+    sessionDone := false
+    tradedToday := false
+    bullCount   := 0
+    bearCount   := 0
+
+if inSession and dayAllowed
+    sessionHigh := math.max(sessionHigh, high)
+    sessionLow  := math.min(sessionLow, low)
+
+if inSession[1] and not inSession and dayAllowed
+    sessionDone := true
+
+// --- 突破计数 ---
+if sessionDone
+    if close > sessionHigh
+        bullCount += 1
+        bearCount := 0
+    else if close < sessionLow
+        bearCount += 1
+        bullCount := 0
+    else
+        bullCount := 0
+        bearCount := 0
+
+// --- 入场 + 绘图 (保留历史) ---
+if sessionDone and not tradedToday and dayAllowed and not eodPassed
+
+    // 做多
+    if bullCount >= brkCandles
+        entry = sessionHigh
+        sl    = getStop(entry, true)
+        tp    = getTp(entry, true)
+
+        strategy.entry("Long", strategy.long, qty=posPct)
+        strategy.exit("Exit L", "Long", stop=sl, limit=tp)
+
+        pb = box.new(bar_index, tp, bar_index + 1, entry,
+             bgcolor=color.new(BULL, 80), border_color=BULL)
+        lb = box.new(bar_index, entry, bar_index + 1, sl,
+             bgcolor=color.new(BEAR, 80), border_color=BEAR)
+        el = line.new(bar_index, entry, bar_index + 1, entry,
+             color=NEUT, style=line.style_dashed)
+
+        array.push(profitBoxes, pb)
+        array.push(lossBoxes, lb)
+        array.push(entryLines, el)
+
+        tradedToday := true
+
+    // 做空
+    if bearCount >= brkCandles
+        entry = sessionLow
+        sl    = getStop(entry, false)
+        tp    = getTp(entry, false)
+
+        strategy.entry("Short", strategy.short, qty=posPct)
+        strategy.exit("Exit S", "Short", stop=sl, limit=tp)
+
+        pb = box.new(bar_index, entry, bar_index + 1, tp,
+             bgcolor=color.new(BULL, 80), border_color=BULL)
+        lb = box.new(bar_index, sl, bar_index + 1, entry,
+             bgcolor=color.new(BEAR, 80), border_color=BEAR)
+        el = line.new(bar_index, entry, bar_index + 1, entry,
+             color=NEUT, style=line.style_dashed)
+
+        array.push(profitBoxes, pb)
+        array.push(lossBoxes, lb)
+        array.push(entryLines, el)
+
+        tradedToday := true
+
+// --- 仅延伸当前持仓的绘图 ---
+if strategy.position_size != 0 and array.size(profitBoxes) > 0
+    last = array.size(profitBoxes) - 1
+    box.set_right(array.get(profitBoxes, last), bar_index + 1)
+    box.set_right(array.get(lossBoxes, last), bar_index + 1)
+    line.set_x2(array.get(entryLines, last), bar_index + 1)
+
+// --- 收盘平仓 (不删除历史绘图) ---
+// 过了强平时间仍持仓则平掉; 跨日兜底防止意外留仓
+if strategy.position_size != 0 and (eodPassed or newDay)
+    strategy.close_all(comment="EOD Close")

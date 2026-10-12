@@ -55,9 +55,10 @@ def fetch_range(
     period_map = {
         "min1": openapi.Period.Min_1,
         "min2": openapi.Period.Min_2,
+        "min5": openapi.Period.Min_5,
     }
     p = period_map[period]
-    suffix = {"min1": "min1", "min2": "min2"}[period]
+    suffix = period
     adj = (
         openapi.AdjustType.ForwardAdjust
         if adjust == "forward"
@@ -120,17 +121,18 @@ def fetch_range(
     return df[["open", "high", "low", "close", "volume"]].astype(float)
 
 
-def update_cache(symbol: str, start: date, end: date, adjust: str = "forward") -> pd.DataFrame:
+def update_cache(symbol: str, start: date, end: date, adjust: str = "forward",
+                 period: str = "min2") -> pd.DataFrame:
     CACHE_DIR.mkdir(exist_ok=True)
     tag = adjust[:3]
-    path = CACHE_DIR / f"{symbol.replace('.', '_')}_{tag}_min2.parquet"
+    path = CACHE_DIR / f"{symbol.replace('.', '_')}_{tag}_{period}.parquet"
 
     old = None
     if path.exists():
         old = pd.read_parquet(path)
         start = min(start, old.index.min().date())
 
-    df = fetch_range(symbol, start, end, adjust)
+    df = fetch_range(symbol, start, end, adjust, period)
     if old is not None and len(old):
         df = (
             pd.concat([old, df])
@@ -142,29 +144,30 @@ def update_cache(symbol: str, start: date, end: date, adjust: str = "forward") -
     return df
 
 
-def load_cache(symbol: str = "SPY.US", adjust: str = "forward") -> pd.DataFrame:
-    tag = adjust[:3]
-    path = CACHE_DIR / f"{symbol.replace('.', '_')}_{tag}_min2.parquet"
+def load_cache(symbol: str = "SPY.US", adjust: str = "forward",
+               period: str = "min2") -> pd.DataFrame:
+    path = cache_path(symbol, adjust, period)
     if not path.exists():
         raise FileNotFoundError(path)
     return pd.read_parquet(path)
 
 
-def cache_path(symbol: str = "SPY.US", adjust: str = "forward") -> Path:
+def cache_path(symbol: str = "SPY.US", adjust: str = "forward",
+               period: str = "min2") -> Path:
     tag = adjust[:3]
-    return CACHE_DIR / f"{symbol.replace('.', '_')}_{tag}_min2.parquet"
+    return CACHE_DIR / f"{symbol.replace('.', '_')}_{tag}_{period}.parquet"
 
 
 def bootstrap_history(symbol: str = "SPY.US", days: int = 120,
-                      adjust: str = "none") -> pd.DataFrame:
+                      adjust: str = "none", period: str = "min2") -> pd.DataFrame:
     """本地无缓存时, 首次启动从长桥拉取近 N 天历史并写入缓存。"""
     end = datetime.now(ET_TZ).date()
     start = end - timedelta(days=days)
-    print(f"[bootstrap] 本地无缓存, 拉取 {start} ~ {end} 的2分钟线 (约1分钟)...")
-    df = fetch_range(symbol, start, end, adjust)
+    print(f"[bootstrap] 本地无缓存, 拉取 {start} ~ {end} 的{period}线 (约1分钟)...")
+    df = fetch_range(symbol, start, end, adjust, period)
     if df.empty:
         raise RuntimeError("bootstrap 拉取到 0 根 bar, 请检查行情权限/网络")
-    df.to_parquet(cache_path(symbol, adjust))
+    df.to_parquet(cache_path(symbol, adjust, period))
     print(f"[bootstrap] 完成: {len(df)} 根 bar -> {df.index.min()} ~ {df.index.max()}")
     return df
 
@@ -177,5 +180,7 @@ if __name__ == "__main__":
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--adjust", default="forward", choices=["forward", "none"])
+    p.add_argument("--period", default="min2", choices=["min1", "min2", "min5"])
     a = p.parse_args()
-    update_cache(a.symbol, date.fromisoformat(a.start), date.fromisoformat(a.end), a.adjust)
+    update_cache(a.symbol, date.fromisoformat(a.start), date.fromisoformat(a.end),
+                 a.adjust, a.period)

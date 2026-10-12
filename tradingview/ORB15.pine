@@ -1,0 +1,308 @@
+//@version=6
+// ==============================================================================
+// ORB15 — SPY 开盘区间突破 (高频版)
+//
+// 用法: SPY 15 分钟图, 常规交易时段 (RTH)
+//
+//   ① 开盘区间: 09:30 起 orMin 分钟的高/低 (15min 图上就是首根 K 线)
+//   ② 质量过滤: 突破K线强度 (实体/收盘位置) + 区间宽度/日ATR 压缩 + 相对放量
+//   ③ 入场:     (默认) 收盘突破 -> 做多/做空; (回撤模式) 突破质量过滤后武装,
+//               等回撤到突破段斐波那契位且突破仍有效时开仓。每日 1 笔, 最晚 tLast
+//   ④ 出场:     可选 (a) 固定ATR止盈止损 (默认 1.4 / 4.2, 图表周期ATR) 或
+//               (b) 日ATR移动止损; 或持有到 tEnd
+//   ⑤ 斐波那契: 回调位 = 极值 ∓ fibLvl×(极值−突破位), 纯价格位置, 不看均线
+// ==============================================================================
+strategy("ORB15", shorttitle="ORB15", overlay=true,
+     process_orders_on_close=true, default_qty_type=strategy.fixed, default_qty_value=100,
+     max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// --- 配色 ---
+const color BULL = #089981
+const color BEAR = #f23645
+const color NEUT = #787b86
+const color ORC  = #2962ff
+const color NONE = #00000000
+
+// --- 输入 ---
+orMin     = input.int(15, "开盘区间 (分钟)", minval=1, group="信号")
+tLastH    = input.int(10, "最晚入场 时", inline="tl", group="信号")
+tLastM    = input.int(45, "分", inline="tl", group="信号")
+tEndH     = input.int(14, "强制平仓 时", inline="te", group="信号")
+tEndM     = input.int(45, "分", inline="te", group="信号")
+
+atrLen    = input.int(14, "日 ATR 长度", group="出场")
+exitMode  = input.string("固定ATR", "出场方式", options=["固定ATR","移动止损"], group="出场")
+atrTrail  = input.float(1.5, "移动止损倍数 (0=关)", step=0.1, group="出场")
+slAtr     = input.float(1.4, "固定止盈止损: 止损 倍数", step=0.1, group="出场")
+tpAtr     = input.float(4.2, "固定止盈止损: 止盈 倍数", step=0.1, group="出场")
+atrExitLen= input.int(12, "固定止盈止损 ATR 长度 (图表周期)", minval=1, group="出场")
+useTrail  = exitMode == "移动止损"
+
+wrAtr     = input.float(0.35, "区间宽度 / 日ATR 上限 (99=关)", step=0.05, group="过滤")
+minBodyPct= input.float(0.7, "突破K线 实体/振幅 下限 (0=关)", step=0.1, group="过滤")
+minClsPos = input.float(0.7, "突破K线 收盘位置 下限 (0=关)", step=0.1, group="过滤")
+useVol    = input.bool(true, "突破需相对放量 (量 / 均量基准)", group="过滤")
+volMult   = input.float(0.7, "放量倍数 (突破量 / 均量)", step=0.1, group="过滤")
+volBaseMode = input.string("同时段(跨日)", "均量基准", options=["同时段(跨日)","SMA","EMA","RMA","中位数"], group="过滤")
+volLen    = input.int(20, "均量根数 (SMA/EMA/RMA/中位数; 同时段=EMA跨度)", minval=1, group="过滤")
+
+usePullback = input.bool(false, "回撤入场 (关=突破即入)", group="入场方式")
+fibLvl    = input.float(0.5, "回调位 (0.0=极值, 1.0=突破位)", minval=0.05, maxval=1.0, step=0.05, group="入场方式")
+
+showOrZone  = input.bool(true, "开盘区间带", group="可视化")
+showLines   = input.bool(true, "入场/止损线", group="可视化")
+showLabels  = input.bool(true, "开仓/平仓标签", group="可视化")
+
+TZ = "America/New_York"
+
+// --- 时间 ---
+barMin   = hour(time, TZ) * 60 + minute(time, TZ)
+barDur   = timeframe.in_seconds() / 60
+closeMin = barMin + barDur
+inRth    = barMin >= 570 and barMin < 960
+newDay   = ta.change(dayofmonth(time, TZ)) != 0
+orEnd    = 570 + orMin
+tLast    = tLastH * 60 + tLastM
+tEnd     = tEndH * 60 + tEndM
+
+// --- 日ATR (自建于会话数据, 无 request.security -> 不重绘; 截至前一日) ---
+var float dayHi = na
+var float dayLo = na
+var float dayCl = na
+var float prevCl = na
+var array<float> dtrs = array.new_float()
+var float atrD = na
+if newDay
+    if not na(dayHi) and not na(prevCl)
+        tr0 = math.max(dayHi - dayLo, math.max(math.abs(dayHi - prevCl), math.abs(dayLo - prevCl)))
+        array.push(dtrs, tr0)
+        if array.size(dtrs) > atrLen
+            array.shift(dtrs)
+        if array.size(dtrs) >= atrLen
+            s = 0.0
+            for i = 0 to array.size(dtrs) - 1
+                s += array.get(dtrs, i)
+            atrD := s / atrLen
+    prevCl := dayCl
+    dayHi := high
+    dayLo := low
+    dayCl := close
+else
+    dayHi := math.max(nz(dayHi, high), high)
+    dayLo := math.min(nz(dayLo, low), low)
+    dayCl := close
+
+// --- 图表周期 ATR (固定止盈止损用) ---
+atrExit = ta.atr(atrExitLen)
+
+// --- 开盘区间 ---
+var float orHi = na
+var float orLo = na
+var bool  done = false
+var int   setup = 0
+var float setupBase = na
+var float setupFav = na
+if newDay
+    orHi := na
+    orLo := na
+    done := false
+    setup := 0
+    setupBase := na
+    setupFav := na
+if inRth and barMin < orEnd
+    orHi := na(orHi) ? high : math.max(orHi, high)
+    orLo := na(orLo) ? low : math.min(orLo, low)
+orReady = inRth and barMin >= orEnd and not na(orHi)
+wAtr    = orReady and atrD > 0 ? (orHi - orLo) / atrD : na
+
+// --- 相对量基准 (可选均量方式) ---
+volSma = ta.sma(volume, volLen)[1]
+volEma = ta.ema(volume, volLen)[1]
+volRma = ta.rma(volume, volLen)[1]
+volMed = ta.median(volume, volLen)[1]
+var array<float> slotEma = array.new_float()
+if bar_index == 0
+    ns = math.max(1, int((960 - 570) / barDur))
+    for i = 1 to ns
+        array.push(slotEma, na)
+slot    = inRth ? int((barMin - 570) / barDur) : -1
+volSame = slot >= 0 and slot < array.size(slotEma) ? array.get(slotEma, slot) : na
+volBase = volBaseMode == "SMA" ? volSma : volBaseMode == "EMA" ? volEma : volBaseMode == "RMA" ? volRma : volBaseMode == "中位数" ? volMed : volSame
+volRel  = not na(volBase) and volBase > 0 ? volume / volBase : na
+// 更新同时段基准 (读取之后再更新, 避免自包含)
+if slot >= 0 and slot < array.size(slotEma)
+    prevV = array.get(slotEma, slot)
+    aV    = 2.0 / (volLen + 1)
+    array.set(slotEma, slot, na(prevV) ? volume : aV * volume + (1 - aV) * prevV)
+
+// --- 持仓状态 ---
+var int   side = 0
+var float maxFav = na
+var float entryUnd = na
+var float trailStop = na
+var float slLevel = na
+var float tpLevel = na
+
+// --- 出场: 固定ATR止盈止损 或 移动止损 + 时间平仓 ---
+exitReason = ""
+float exitRet = na
+if side != 0 and not newDay
+    maxFav := side == 1 ? math.max(nz(maxFav, close), high) : math.min(nz(maxFav, close), low)
+    trailStop := useTrail and atrTrail > 0 and not na(atrD) ? maxFav - side * atrTrail * atrD : na
+    slLevel := not useTrail and not na(atrExit) and not na(entryUnd) ? entryUnd - side * slAtr * atrExit : na
+    tpLevel := not useTrail and not na(atrExit) and not na(entryUnd) ? entryUnd + side * tpAtr * atrExit : na
+    stopHit  = useTrail ? (not na(trailStop) and (close - trailStop) * side < 0) : (not na(slLevel) and (close - slLevel) * side < 0)
+    tpHit    = not useTrail and not na(tpLevel) and (close - tpLevel) * side > 0
+    timeHit  = closeMin >= tEnd
+    reason   = stopHit ? "STOP" : tpHit ? "TP" : timeHit ? "TIME" : ""
+    if reason != ""
+        strategy.close_all(comment=reason)
+        exitReason := reason
+        exitRet := side * (close - entryUnd) / entryUnd
+        side := 0
+        maxFav := na
+        trailStop := na
+        slLevel := na
+        tpLevel := na
+
+// --- 突破信号 / 回撤入场 ---
+entered   = false
+entrySide = 0
+wasArmed  = setup != 0
+
+// 形态失效: 收盘回到区间内
+if setup == 1 and close < setupBase
+    setup := 0
+    setupFav := na
+else if setup == -1 and close > setupBase
+    setup := 0
+    setupFav := na
+
+// 更新已武装形态的有利极值
+if setup == 1
+    setupFav := math.max(nz(setupFav, high), high)
+else if setup == -1
+    setupFav := math.min(nz(setupFav, low), low)
+
+// 突破: 质量过滤 -> 武装(回撤模式) 或 立即入场(突破模式)
+if orReady and not done and closeMin <= tLast and strategy.position_size == 0 and setup == 0
+    brk = close > orHi ? 1 : close < orLo ? -1 : 0
+    if brk != 0
+        rng     = high - low
+        bodyPct = rng > 0 ? math.abs(close - open) / rng : 1.0
+        clsPos  = rng > 0 ? (brk == 1 ? (close - low) / rng : (high - close) / rng) : 0.5
+        okW = wrAtr >= 99 or (not na(wAtr) and wAtr <= wrAtr)
+        okS = (minBodyPct <= 0 or bodyPct >= minBodyPct) and (minClsPos <= 0 or clsPos >= minClsPos)
+        okV = not useVol or (not na(volRel) and volRel >= volMult)
+        if not na(atrExit) and okW and okS and okV
+            if usePullback
+                setup     := brk
+                setupBase := brk == 1 ? orHi : orLo
+                setupFav  := brk == 1 ? high : low
+            else
+                entrySide := brk
+
+// 回撤触发: 回撤到斐波那契位且突破仍有效 -> 开仓
+if usePullback and setup != 0 and wasArmed and strategy.position_size == 0 and closeMin <= tLast
+    leg    = math.abs(setupFav - setupBase)
+    lvl    = setup == 1 ? setupFav - fibLvl * leg : setupFav + fibLvl * leg
+    hit    = leg > 0 and (setup == 1 ? low <= lvl : high >= lvl)
+    intact = setup == 1 ? close > setupBase : close < setupBase
+    if hit and intact and not na(atrExit)
+        entrySide := setup
+
+// 执行开仓
+if entrySide != 0
+    side      := entrySide
+    entryUnd  := close
+    maxFav    := close
+    done      := true
+    trailStop := useTrail and atrTrail > 0 and not na(atrD) ? close - entrySide * atrTrail * atrD : na
+    slLevel   := not useTrail and not na(atrExit) ? close - entrySide * slAtr * atrExit : na
+    tpLevel   := not useTrail and not na(atrExit) ? close + entrySide * tpAtr * atrExit : na
+    entered   := true
+    setup     := 0
+    setupFav  := na
+    strategy.entry(entrySide == 1 ? "L" : "S", entrySide == 1 ? strategy.long : strategy.short)
+
+if side != 0 and closeMin >= 960
+    strategy.close_all(comment="EOD")
+    side := 0
+    maxFav := na
+    trailStop := na
+    slLevel := na
+    tpLevel := na
+
+// =============================================================================
+// 绘图层
+// =============================================================================
+inPos = side != 0
+
+// 交易时段浅底
+bgcolor(inRth ? color.new(NEUT, 96) : na, title="Session BG")
+
+// 开盘区间带 (渐变填充)
+pOrHi = plot(showOrZone and orReady ? orHi : na, "OR High", color.new(ORC, 20), 1, plot.style_linebr)
+pOrLo = plot(showOrZone and orReady ? orLo : na, "OR Low", color.new(ORC, 20), 1, plot.style_linebr)
+fill(pOrHi, pOrLo, orHi, orLo, showOrZone ? color.new(ORC, 90) : NONE, showOrZone ? color.new(ORC, 96) : NONE, "OR Zone")
+
+// 右端 OR 药丸标签
+var label orHiLbl = na
+var label orLoLbl = na
+if showOrZone and orReady
+    if na(orHiLbl)
+        orHiLbl := label.new(bar_index + 2, orHi, "OR High", style=label.style_label_left, color=color.new(ORC, 15), textcolor=color.white, size=size.small)
+        orLoLbl := label.new(bar_index + 2, orLo, "OR Low", style=label.style_label_left, color=color.new(ORC, 15), textcolor=color.white, size=size.small)
+    else
+        label.set_xy(orHiLbl, bar_index + 2, orHi)
+        label.set_xy(orLoLbl, bar_index + 2, orLo)
+
+// 入场 / 止损 / 止盈 线 + 渐变带
+stopLvl = useTrail ? trailStop : slLevel
+pEnt  = plot(showLines and inPos ? entryUnd : na, "Entry", color.new(NEUT, 20), 1, plot.style_linebr)
+pStop = plot(showLines and inPos and not na(stopLvl) ? stopLvl : na, "止损", color.new(BEAR, 0), 2, plot.style_linebr)
+pTp   = plot(showLines and inPos and not na(tpLevel) ? tpLevel : na, "止盈", color.new(BULL, 0), 2, plot.style_linebr)
+pPrice= plot(showLines and inPos ? close : na, "价格参考", display=display.none)
+fill(pStop, pPrice, top_value = side == -1 ? stopLvl : close, bottom_value = side == -1 ? close : stopLvl, top_color = color.new(BEAR, 70), bottom_color = color.new(BEAR, 96), title="止损回撤带")
+fill(pEnt, pTp, top_value = side == 1 ? tpLevel : entryUnd, bottom_value = side == 1 ? entryUnd : tpLevel, top_color = color.new(BULL, 82), bottom_color = color.new(BULL, 92), title="盈利目标带")
+fill(pEnt, pStop, showLines ? color.new(BEAR, 92) : NONE, title="风险区")
+
+// 右端止损/止盈药丸
+var label stopLbl = na
+if showLines and inPos and not na(stopLvl)
+    if na(stopLbl)
+        stopLbl := label.new(bar_index + 2, stopLvl, "STOP", style=label.style_label_left, color=color.new(BEAR, 20), textcolor=color.white, size=size.small)
+    else
+        label.set_xy(stopLbl, bar_index + 2, stopLvl)
+if not inPos and not na(stopLbl)
+    label.delete(stopLbl)
+    stopLbl := na
+
+// 待入场回撤目标位 (突破已武装, 等回撤到斐波那契位)
+pullLvl = usePullback and setup != 0 and not na(setupBase) and not na(setupFav) ? (setup == 1 ? setupFav - fibLvl * math.abs(setupFav - setupBase) : setupFav + fibLvl * math.abs(setupFav - setupBase)) : na
+plot(showLines ? pullLvl : na, "回撤入场位", color.new(#ff9800, 0), 2, plot.style_linebr)
+
+// 突破武装标记 (回撤模式下, 突破已过滤通过, 等待回撤)
+if showLabels and usePullback and setup != 0 and not wasArmed
+    up = setup == 1
+    label.new(bar_index, up ? high : low, up ? "▲突破待回撤" : "▼突破待回撤",
+         yloc=up ? yloc.abovebar : yloc.belowbar, style=up ? label.style_label_down : label.style_label_up,
+         color=color.new(#ff9800, 20), textcolor=color.white, size=size.tiny)
+
+// 开仓/平仓标签
+if showLabels and entered
+    up = side == 1
+    label.new(bar_index, up ? low : high, up ? "▲ LONG" : "▼ SHORT",
+         yloc=up ? yloc.belowbar : yloc.abovebar, style=up ? label.style_label_up : label.style_label_down,
+         color=color.new(up ? BULL : BEAR, 12), textcolor=color.white, size=size.small)
+
+if showLabels and exitReason != ""
+    win = exitRet >= 0
+    label.new(bar_index, win ? high : low,
+         "✕ " + exitReason + "  " + (win ? "+" : "") + str.tostring(exitRet * 100, "#.0") + "%",
+         yloc=win ? yloc.abovebar : yloc.belowbar, style=win ? label.style_label_down : label.style_label_up,
+         color=color.new(win ? BULL : BEAR, 20), textcolor=color.white, size=size.small)
+
+// 数据窗口
+plot(wAtr, "区间/ATR", display=display.data_window)
+plot(volRel, "相对量", display=display.data_window)

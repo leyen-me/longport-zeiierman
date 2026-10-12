@@ -66,9 +66,25 @@ class OptionPick:
     spot: float
 
 
+def size_contracts(ask: float, budget: float, use_full_budget: bool = False) -> int:
+    """按预算计算可买张数。
+
+    use_full_budget=False (默认, ZTP): 最多 2 张, 2 张超预算则 1 张, 1 张仍超则 0。
+    use_full_budget=True (ORB): 用满预算买尽量多张 (风险=权利金 ≤ budget),
+                               只要 1 张不超过预算就至少买 1 张。
+    """
+    cost = ask * 100
+    if cost <= 0 or budget <= 0:
+        return 0
+    if use_full_budget:
+        return int(budget // cost)
+    return 2 if 2 * cost <= budget else (1 if cost <= budget else 0)
+
+
 def pick_option(qctx, underlying: str, is_call: bool, spot: float,
                 budget: float = 200.0, target_delta: float = 0.50,
-                now: datetime | None = None) -> OptionPick | None:
+                now: datetime | None = None,
+                use_full_budget: bool = False) -> OptionPick | None:
     now = now or datetime.now(ET)
     expiry = pick_expiry(qctx, underlying, now)
     chain = qctx.option_chain_info_by_date(underlying, expiry)
@@ -96,7 +112,7 @@ def pick_option(qctx, underlying: str, is_call: bool, spot: float,
             delta = -delta
         if not (0.25 <= abs(delta) <= 0.75):
             continue
-        qty = 2 if 2 * ask * 100 <= budget else (1 if ask * 100 <= budget else 0)
+        qty = size_contracts(ask, budget, use_full_budget)
         if qty == 0:
             continue
         gap = abs(abs(delta) - target_delta)
