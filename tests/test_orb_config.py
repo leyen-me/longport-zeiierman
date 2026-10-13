@@ -23,6 +23,9 @@ EXPECTED = {
     "use_gap_filter": False,          # 关 (更频繁)
     "use_firstbar_filter": True,
     "first_signal_only": True,        # 首个突破锁当日
+    "use_strength_filter": True,      # v2.1 质变过滤: 顺势发力
+    "strength_atr_mult": 0.15,
+    "use_gapfill_filter": True,       # v2.1 质变过滤: 跳空未回补
     "use_trail": False,               # 关移动止损
     "trail_mult": 0.75,
     "eod_hour": 12,

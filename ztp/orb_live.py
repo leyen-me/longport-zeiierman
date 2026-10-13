@@ -11,7 +11,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from .orb import ORBConfig, _round_tick
+from .orb import ORBConfig, _round_tick, prior_daily_atr
 
 
 @dataclass
@@ -38,6 +38,9 @@ class ORBLiveState:
     R: float = np.nan
     run_ext: float = np.nan
     last_date: date | None = None
+    # v2.1 质变过滤: 前一日日线 ATR + 跳空是否在 OR 内回补
+    atr_daily: float = np.nan
+    or_gap_filled: bool = False
 
 
 @dataclass
@@ -79,6 +82,16 @@ class ORBLiveStrategy:
         prev = self.df[self.df.index.date < today]
         return float(prev["close"].iloc[-1]) if len(prev) else float("nan")
 
+    def _daily_atr(self, today, length: int = 14) -> float:
+        """前一日为止的日线 ATR(14); 与 ztp/orb.py 引擎共用 prior_daily_atr; 不足则 NaN。"""
+        if len(self.df) == 0:
+            return float("nan")
+        s = prior_daily_atr(self.df, self.cfg.tz, length)
+        key = pd.Timestamp(today)
+        key = key.tz_localize(s.index.tz) if s.index.tz is not None else key
+        v = s.get(key, np.nan)
+        return float(v) if v == v else float("nan")
+
     # ---------- 重启预热: 从当日已有 bar 重建开盘区间状态 ----------
 
     def prime(self):
@@ -98,9 +111,13 @@ class ORBLiveStrategy:
                 st.day_open = float(r["open"])
                 st.first_dir = 1 if r["close"] >= r["open"] else -1
                 st.prev_close = self._prev_day_close(today)
+                st.atr_daily = self._daily_atr(today)
+                st.or_gap_filled = False
             if in_sess:
                 st.session_high = max(st.session_high, r["high"])
                 st.session_low = min(st.session_low, r["low"])
+                if st.prev_close == st.prev_close and r["low"] <= st.prev_close <= r["high"]:
+                    st.or_gap_filled = True
             if in_sess_prev and not in_sess:
                 st.session_done = True
             if st.session_done:
@@ -115,22 +132,28 @@ class ORBLiveStrategy:
                 if ts.dayofweek in self.cfg.trade_days and (long_sig or short_sig):
                     # 历史已出现突破信号 -> 不追补; first_signal_only 时无论过滤与否都锁当日
                     if self.cfg.first_signal_only \
-                            or (long_sig and self._filter_ok(1)) \
-                            or (short_sig and self._filter_ok(-1)):
+                            or (long_sig and self._filter_ok(1, r["close"])) \
+                            or (short_sig and self._filter_ok(-1, r["close"])):
                         st.traded_today = True
 
-    def _filter_ok(self, direction: int) -> bool:
-        """v2 过滤: 跳空方向 + 首根方向 须与突破方向一致。"""
+    def _filter_ok(self, direction: int, close: float) -> bool:
+        """v2.1 过滤: 跳空方向 + 首根方向 + 顺势发力 + 跳空未回补。"""
         cfg = self.cfg
         st = self.st
         gap_known = st.prev_close == st.prev_close
+        atr_ok = st.atr_daily == st.atr_daily and st.atr_daily > 0
         if direction > 0:
             gap_ok = (not cfg.use_gap_filter) or (not gap_known) or st.day_open > st.prev_close
             fd_ok = (not cfg.use_firstbar_filter) or st.first_dir > 0
+            str_ok = (not cfg.use_strength_filter) or (not atr_ok) or \
+                (close - st.day_open) >= cfg.strength_atr_mult * st.atr_daily
         else:
             gap_ok = (not cfg.use_gap_filter) or (not gap_known) or st.day_open < st.prev_close
             fd_ok = (not cfg.use_firstbar_filter) or st.first_dir < 0
-        return gap_ok and fd_ok
+            str_ok = (not cfg.use_strength_filter) or (not atr_ok) or \
+                (st.day_open - close) >= cfg.strength_atr_mult * st.atr_daily
+        gapfill_ok = (not cfg.use_gapfill_filter) or (not st.or_gap_filled)
+        return gap_ok and fd_ok and str_ok and gapfill_ok
 
     # ---------- 外部事件 ----------
 
@@ -175,16 +198,20 @@ class ORBLiveStrategy:
         day_ok = ts.dayofweek in cfg.trade_days
         eod = self._eod_passed(m)
 
-        # 开盘区间构建 (v2: 记录开盘价/首根方向/昨日收盘)
+        # 开盘区间构建 (v2: 记录开盘价/首根方向/昨日收盘; v2.1: 日ATR/跳空回补)
         if in_sess and not in_sess_prev:
             st.session_high, st.session_low = h, l
             st.session_done, st.traded_today, st.bull, st.bear = False, False, 0, 0
             st.day_open = o
             st.first_dir = 1 if c >= o else -1
             st.prev_close = self._prev_day_close(ts.date())
+            st.atr_daily = self._daily_atr(ts.date())
+            st.or_gap_filled = False
         if in_sess:
             st.session_high = max(st.session_high, h)
             st.session_low = min(st.session_low, l)
+            if st.prev_close == st.prev_close and l <= st.prev_close <= h:
+                st.or_gap_filled = True
         if in_sess_prev and not in_sess:
             st.session_done = True
 
@@ -204,9 +231,9 @@ class ORBLiveStrategy:
             if long_sig or short_sig:
                 if cfg.first_signal_only:
                     st.traded_today = True          # 首个突破出现即锁当日
-                if long_sig and self._filter_ok(1):
+                if long_sig and self._filter_ok(1, c):
                     self._open(1, i, c, st.session_high, actions)
-                elif short_sig and self._filter_ok(-1):
+                elif short_sig and self._filter_ok(-1, c):
                     self._open(-1, i, c, st.session_low, actions)
 
         # 强平

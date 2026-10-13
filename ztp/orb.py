@@ -52,6 +52,12 @@ class ORBConfig:
     # 当日首个突破信号若被过滤, 是否锁定当日: True=锁定 (更优, 对齐 TV 新导出版)
     first_signal_only: bool = True
 
+    # v2.1 质变过滤 (research/orb_factors.py, 逐笔亏损归因):
+    #   顺势发力 + 跳空在 OR 内未回补 —— 只剔除净亏损单, 保留频率且总利润↑
+    use_strength_filter: bool = True     # entry-open 须 ≥ k×日ATR (顺突破方向)
+    strength_atr_mult: float = 0.15
+    use_gapfill_filter: bool = True      # 跳空不得在 OR 内被回补
+
     # v2 移动止损: 极值 ∓ trail_mult×R (R=|入场-初始止损|)
     # 按用户决定: 关闭移动止损 (固定 SL/TP 锚 OR 边界, 胜率更高)
     use_trail: bool = False
@@ -108,6 +114,25 @@ def _minute_of_day(index: pd.DatetimeIndex, tz: str) -> np.ndarray:
     return (local.hour * 60 + local.minute).to_numpy()
 
 
+def prior_daily_atr(df: pd.DataFrame, tz: str, length: int = 14) -> pd.Series:
+    """每个交易日"前一交易日为止"的日线 ATR(length)。
+
+    返回 Series, 索引为 tz 归一化到当日 0 点的 DatetimeIndex; 值与当日 5min bar 无关,
+    故引擎 (ztp/orb.py) 与实时状态机 (ztp/orb_live.py) 共用同一实现, 保证一致。
+    数据不足 length 个交易日时值为 NaN。
+    """
+    daykey = df.index.tz_convert(tz).normalize()
+    dly = pd.DataFrame(
+        {"h": df["high"].to_numpy(float), "l": df["low"].to_numpy(float),
+         "c": df["close"].to_numpy(float)},
+        index=daykey,
+    ).groupby(level=0).agg(h=("h", "max"), l=("l", "min"), c=("c", "last"))
+    pc = dly["c"].shift(1)
+    tr = np.maximum(dly["h"] - dly["l"],
+                    np.maximum((dly["h"] - pc).abs(), (dly["l"] - pc).abs()))
+    return tr.rolling(length).mean().shift(1)
+
+
 def run(df: pd.DataFrame, cfg: ORBConfig) -> pd.DataFrame:
     """df: 5 分钟 OHLCV, 索引为美东 tz-aware DatetimeIndex。"""
     o = df["open"].to_numpy(float)
@@ -148,6 +173,13 @@ def run(df: pd.DataFrame, cfg: ORBConfig) -> pd.DataFrame:
         day_fdir[i] = cur_fdir
         prev_close[i] = cur_prev
         last_close = c[i]
+
+    # v2.1 质变过滤辅助量: 前一日日线 ATR14 (顺势发力阈值) + OR 内是否回补跳空
+    daykey = times.tz_convert(cfg.tz).normalize()
+    atr_daily = daykey.map(prior_daily_atr(df, cfg.tz)).to_numpy(float)
+    _filled_bar = in_sess & np.isfinite(prev_close) & (l <= prev_close) & (h >= prev_close)
+    _fill_by_day = pd.Series(_filled_bar, index=daykey).groupby(level=0).max()
+    or_filled = daykey.map(_fill_by_day).fillna(False).to_numpy(bool)
 
     equity = cfg.initial_capital
     pos = 0
@@ -292,15 +324,22 @@ def run(df: pd.DataFrame, cfg: ORBConfig) -> pd.DataFrame:
                          or day_open[i] < prev_close[i])
             fd_long = (not cfg.use_firstbar_filter) or day_fdir[i] > 0
             fd_short = (not cfg.use_firstbar_filter) or day_fdir[i] < 0
+            _atr = atr_daily[i]
+            _atr_ok = np.isfinite(_atr) and _atr > 0
+            str_long = (not cfg.use_strength_filter) or (not _atr_ok) or \
+                (c[i] - day_open[i]) >= cfg.strength_atr_mult * _atr
+            str_short = (not cfg.use_strength_filter) or (not _atr_ok) or \
+                (day_open[i] - c[i]) >= cfg.strength_atr_mult * _atr
+            gapfill_ok = (not cfg.use_gapfill_filter) or (not or_filled[i])
             long_sig = bull >= cfg.brk_candles
             short_sig = bear >= cfg.brk_candles
             if long_sig or short_sig:
                 if cfg.first_signal_only:
                     traded_today = True          # 首个突破出现即锁当日
-                if long_sig and gap_long and fd_long:
+                if long_sig and gap_long and fd_long and str_long and gapfill_ok:
                     open_trade(1, i, session_high)
                     traded_today = True
-                elif short_sig and gap_short and fd_short:
+                elif short_sig and gap_short and fd_short and str_short and gapfill_ok:
                     open_trade(-1, i, session_low)
                     traded_today = True
 

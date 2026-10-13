@@ -1,6 +1,7 @@
 """SPY 0DTE 期权选择: 到期日/期权链/BS delta/选档/预算数量规则。"""
 
 import math
+import time as _time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime
 
@@ -44,14 +45,31 @@ def years_to_expiry(expiry: date, now: datetime) -> float:
     return secs / (365.0 * 24 * 3600)
 
 
-def _top_of_book(qctx, sym: str) -> tuple[float, float]:
+def _top_of_book(qctx, sym: str, retries: int = 3, pause: float = 0.25
+                 ) -> tuple[float, float]:
+    """逐档买卖价 (depth)。偶发拿不到时重试; 仍失败返回 (0,0)。"""
+    for k in range(retries):
+        try:
+            d = qctx.depth(sym)
+            bid = float(d.bids[0].price) if d.bids and d.bids[0].price is not None else 0.0
+            ask = float(d.asks[0].price) if d.asks and d.asks[0].price is not None else 0.0
+            if bid > 0 or ask > 0:
+                return bid, ask
+        except Exception:
+            pass
+        if k < retries - 1:
+            _time.sleep(pause)
+    return 0.0, 0.0
+
+
+def last_done(qctx, sym: str) -> float:
+    """期权最新成交价 (盘口缺失时的兜底参考); 无则 0。"""
     try:
-        d = qctx.depth(sym)
-        bid = float(d.bids[0].price) if d.bids and d.bids[0].price is not None else 0.0
-        ask = float(d.asks[0].price) if d.asks and d.asks[0].price is not None else 0.0
-        return bid, ask
+        q = qctx.option_quote([sym])[0]
+        v = float(q.last_done or 0)
+        return v if v > 0 else 0.0
     except Exception:
-        return 0.0, 0.0
+        return 0.0
 
 
 @dataclass
@@ -137,8 +155,9 @@ def pick_option(qctx, underlying: str, is_call: bool, spot: float,
 
 
 def top_bid(qctx, sym: str, fallback: float = 0.0) -> float:
+    """最优买价: depth → 最新成交价 → fallback。"""
     bid, _ = _top_of_book(qctx, sym)
     if bid > 0:
         return bid
-    q = qctx.option_quote([sym])[0]
-    return float(q.last_done or fallback)
+    v = last_done(qctx, sym)
+    return v if v > 0 else fallback

@@ -55,7 +55,8 @@ def _onoff(v: bool) -> str:
 class ORBLiveRunner:
     def __init__(self, dry_run: bool = False, budget: float = 300.0,
                  target_delta: float = 0.50, max_contracts: int | None = None,
-                 min_one: bool = True):
+                 min_one: bool = True, size_pct: float = 0.25,
+                 use_equity_sizing: bool = True, min_budget: float = 50.0):
         os.environ.setdefault("LONGPORT_PUSH_CANDLESTICK_MODE", "confirmed")
         missing = [
             k for k in ("LONGPORT_APP_KEY", "LONGPORT_APP_SECRET", "LONGPORT_ACCESS_TOKEN")
@@ -73,6 +74,14 @@ class ORBLiveRunner:
         self.target_delta = target_delta
         self.max_contracts = max_contracts
         self.min_one = min_one
+        # 下注: 每笔用账户净权益的 size_pct (默认 25%); 读不到权益时回退固定 budget
+        self.size_pct = size_pct
+        self.use_equity_sizing = use_equity_sizing
+        self.min_budget = min_budget
+        # 权益缓存兜底 (API 异常时用)
+        self._last_equity: float | None = None
+        self._last_equity_ts: float = 0.0
+        self.equity_max_age_sec = 24 * 3600
         self.openapi = __import__("longport").openapi
         self.qctx = self.openapi.QuoteContext(_config())
         self.tctx = None if dry_run else self.openapi.TradeContext(_config())
@@ -84,6 +93,7 @@ class ORBLiveRunner:
         self.state_path = results_dir() / "orb_live_state.json"
         self.trades_path = results_dir() / "orb_live_trades.csv"
         self.option_pos: dict | None = None
+        self._last_bid: dict[str, float] = {}   # 盘口缺失时的最近一次买价缓存
         self.entering = False
         self.exiting = False
         self._last_bar_ts: pd.Timestamp | None = None
@@ -177,8 +187,12 @@ class ORBLiveRunner:
             "day_open": st.day_open if st.day_open == st.day_open else None,
             "prev_close": st.prev_close if st.prev_close == st.prev_close else None,
             "first_dir": st.first_dir,
+            "atr_daily": st.atr_daily if st.atr_daily == st.atr_daily else None,
+            "or_gap_filled": st.or_gap_filled,
             "exit_armed": st.exit_armed, "exit_from": st.exit_from,
             "option_pos": self.option_pos,
+            "last_equity": self._last_equity,
+            "last_equity_ts": self._last_equity_ts,
         }
         self.state_path.write_text(json.dumps(data, default=str))
 
@@ -190,6 +204,10 @@ class ORBLiveRunner:
         except Exception as e:
             log.warning(f"状态文件损坏, 忽略: {e}")
             return
+        # 权益缓存与日期无关, 先恢复 (供 API 异常兜底)
+        if data.get("last_equity") is not None:
+            self._last_equity = float(data["last_equity"])
+            self._last_equity_ts = float(data.get("last_equity_ts") or 0.0)
         if data.get("date") != str(_now().date()):
             return
         st = self.strategy.st
@@ -208,6 +226,8 @@ class ORBLiveRunner:
         st.day_open = data.get("day_open") if data.get("day_open") is not None else float("nan")
         st.prev_close = data.get("prev_close") if data.get("prev_close") is not None else float("nan")
         st.first_dir = data.get("first_dir", 0)
+        st.atr_daily = data.get("atr_daily") if data.get("atr_daily") is not None else float("nan")
+        st.or_gap_filled = data.get("or_gap_filled", False)
         st.exit_armed, st.exit_from = data["exit_armed"], data["exit_from"]
         self.option_pos = data.get("option_pos")
         if st.pos_dir != 0:
@@ -218,8 +238,72 @@ class ORBLiveRunner:
 
     # ---------- 期权执行 ----------
 
-    def _underlying_last(self) -> float:
-        return float(self.qctx.quote([SYMBOL])[0].last_done)
+    def _underlying_last(self, retries: int = 3) -> float:
+        for k in range(retries):
+            try:
+                q = self.qctx.quote([SYMBOL])
+                if q and q[0].last_done and float(q[0].last_done) > 0:
+                    return float(q[0].last_done)
+            except Exception as e:
+                if k == retries - 1:
+                    log.warning(f"SPY 报价获取失败: {e!r}")
+            time_mod.sleep(0.3)
+        q = self.qctx.quote([SYMBOL])
+        return float(q[0].last_done)
+
+    def _best_bid(self, osym: str) -> float:
+        """期权买价: 实时盘口 → 最新成交价 → 本地最近一次缓存。无则 0。"""
+        bid = top_bid(self.qctx, osym)
+        if bid > 0:
+            self._last_bid[osym] = bid
+            return bid
+        return self._last_bid.get(osym, 0.0)
+
+    def _account_equity(self, retries: int = 2) -> float | None:
+        """账户净权益 (net_assets); 失败回退 total_cash; 再失败返回 None。
+
+        读取成功会写入本地缓存 (_last_equity/_last_equity_ts), 供 API 异常时兜底。
+        """
+        if self.tctx is None:
+            return None
+        for attempt in range(retries + 1):
+            try:
+                ab = self.tctx.account_balance()
+                for attr in ("net_assets", "total_cash"):
+                    v = getattr(ab, attr, None)
+                    if v is not None:
+                        eq = float(v)
+                        self._last_equity = eq
+                        self._last_equity_ts = time_mod.time()
+                        return eq
+                return None  # 接口返回但字段为空
+            except Exception as e:
+                if attempt < retries:
+                    time_mod.sleep(0.5 * (attempt + 1))
+                    continue
+                log.warning(f"读取账户权益失败 (重试{retries}次): {e!r}")
+        return None
+
+    def _entry_budget(self) -> float:
+        """每笔下注预算 = 账户权益 × size_pct (下限 min_budget)。
+
+        兜底顺序: 实时权益 -> 最近一次成功权益(≤ equity_max_age_sec) -> 固定 budget。
+        """
+        if self.use_equity_sizing:
+            eq = self._account_equity()
+            if eq is not None and eq > 0:
+                return round(max(eq * self.size_pct, self.min_budget), 2)
+            # API 异常: 用最近一次成功读取的权益 (含跨重启持久化)
+            age = time_mod.time() - self._last_equity_ts
+            if self._last_equity and self._last_equity > 0 \
+                    and age <= self.equity_max_age_sec:
+                log.warning(
+                    f"权益API异常, 用缓存权益 ${self._last_equity:.0f} "
+                    f"(读取于 {age/3600:.1f}h 前) 计算下单预算"
+                )
+                return round(max(self._last_equity * self.size_pct, self.min_budget), 2)
+            log.warning(f"无可用权益(缓存过期/为空), 回退固定预算 ${self.budget:.0f}")
+        return self.budget
 
     def _option_entry(self, direction: int, ref_price: float, bar_i: int):
         if self.entering or self.strategy.st.pos_dir == 0:
@@ -228,19 +312,26 @@ class ORBLiveRunner:
         try:
             spot = self._underlying_last()
             is_call = direction > 0
-            pick = pick_option(
-                self.qctx, SYMBOL, is_call, spot,
-                budget=self.budget, target_delta=self.target_delta,
-                use_full_budget=True, max_qty=self.max_contracts, min_one=self.min_one,
-            )
+            budget = self._entry_budget()
+            pick = None
+            for attempt in range(3):
+                pick = pick_option(
+                    self.qctx, SYMBOL, is_call, spot,
+                    budget=budget, target_delta=self.target_delta,
+                    use_full_budget=True, max_qty=self.max_contracts, min_one=self.min_one,
+                )
+                if pick is not None:
+                    break
+                log.warning(f"选档失败(第{attempt+1}/3 次, 可能盘口缺失), 重试...")
+                time_mod.sleep(1.0)
             if pick is None:
-                log.warning(f"无满足预算({self.budget})/delta({self.target_delta})的期权, 放弃信号")
+                log.warning(f"3 次选档均失败(${budget:.0f}/{self.target_delta}), 放弃信号")
                 self.strategy.st.pos_dir = 0
                 self.strategy.st.entry_i = -1
                 return
             log.info(
                 f"信号 {'LONG' if is_call else 'SHORT'} -> 买 {pick.qty} 张 {pick.symbol} "
-                f"(strike={pick.strike} delta={pick.delta:.2f} ask={pick.ask}) | SPY={spot}"
+                f"(预算=${budget:.0f} strike={pick.strike} delta={pick.delta:.2f} ask={pick.ask}) | SPY={spot}"
             )
             filled = self._submit_and_wait(pick.symbol, "Buy", pick.qty, pick.ask)
             if filled <= 0:
@@ -257,7 +348,7 @@ class ORBLiveRunner:
             self.option_pos = {
                 "symbol": pick.symbol, "strike": pick.strike, "is_call": is_call,
                 "qty": filled, "ask_ref": pick.ask, "spot_at_entry": spot,
-                "signal_price": ref_price, "bar_i": bar_i,
+                "signal_price": ref_price, "bar_i": bar_i, "budget": budget,
                 "time": _now().isoformat(),
             }
             self.save_state()
@@ -336,6 +427,8 @@ class ORBLiveRunner:
     def _exit_chase(self, osym: str, qty: int) -> tuple[int, float | None]:
         remaining = qty
         cycle = 0
+        no_quote = 0
+        warned = False
         total_filled = 0
         last_px: float | None = None
         while remaining > 0:
@@ -346,11 +439,25 @@ class ORBLiveRunner:
             if m >= 15 * 60 + 59 and cycle > 5:
                 log.error("已到 15:59 仍有 %d 张未成交, 停止追价, 请人工处理!", remaining)
                 break
-            bid = top_bid(self.qctx, osym)
+            bid = self._best_bid(osym)
+            if bid <= 0:
+                # 盘口偶发缺失: 优先用缓存; 完全没有则重试, 绝不盲挂低价
+                no_quote += 1
+                log.warning(f"追价平仓 第{cycle+1}轮: 期权盘口缺失(无缓存报价), 重试 {no_quote}")
+                if no_quote == 6 and not warned:
+                    warned = True
+                    self.mailer.send(
+                        f"[ORB][警告] 平仓暂无盘口报价",
+                        f"{osym} 剩余 {remaining} 张, 正在重试获取买价...\n时间={_now():%H:%M:%S} ET",
+                    )
+                time_mod.sleep(1.5)
+                cycle += 1
+                continue
+            no_quote = 0
             chase = min(cycle, 6) * 0.05
             if m >= 15 * 60 + 58:
                 chase += 0.10
-            px = max(round((bid if bid > 0 else 0.05) - chase, 2), 0.01)
+            px = max(round(bid - chase, 2), 0.01)
             log.info(f"追价平仓 第{cycle+1}轮: 卖 {remaining}x @ {px} (bid={bid})")
             try:
                 done = self._submit_and_wait(osym, "Sell", remaining, px,
@@ -378,7 +485,7 @@ class ORBLiveRunner:
         self.exiting = True
         try:
             if self.dry_run:
-                bid = top_bid(self.qctx, op["symbol"])
+                bid = self._best_bid(op["symbol"])
                 log.info(f"[DRY-RUN] 卖出 {op['qty']}x {op['symbol']} @ ~{bid} ({reason})")
                 self.notify_exit(reason, est_exit_px_ref=bid)
                 return
@@ -398,8 +505,13 @@ class ORBLiveRunner:
             self.exiting = False
 
     def notify_exit(self, reason: str, est_exit_px_ref: float | None = None):
-        spot = self._underlying_last()
         op = self.option_pos
+        # SPY 报价偶发失败也不能阻断平仓记账 (否则状态机不会清仓、可能重复卖)
+        try:
+            spot = self._underlying_last()
+        except Exception as e:
+            spot = float(op.get("spot_at_entry", 0.0)) if op else 0.0
+            log.warning(f"平仓时 SPY 报价失败, 用入场价兜底 {spot}: {e!r}")
         exit_px = op.get("signal_price", spot) if op else spot
         self.strategy.notify_exit_fill(spot, reason)
         if op:
@@ -447,9 +559,10 @@ class ORBLiveRunner:
             "=" * 64,
             "  ▶ 策略 = ORB30 v2   (5分钟K线 · Python ztp.orb_runner)",
             f"  ▶ 规则 = OR={self.cfg.or_minutes}min 确认{self.cfg.brk_candles}根 交易日={self.cfg.trade_days}",
-            f"  ▶ 过滤 = 跳空{_onoff(self.cfg.use_gap_filter)} 首根{_onoff(self.cfg.use_firstbar_filter)} "
-            f"锁当日{_onoff(self.cfg.first_signal_only)} 移动止损{_onoff(self.cfg.use_trail)}",
-            f"  ▶ 下单 = 至少1张(不限价), 多张总≤${self.budget:.0f}, delta={self.target_delta}",
+            f"  ▶ 过滤 = 首根{_onoff(self.cfg.use_firstbar_filter)} "
+            f"顺势{_onoff(self.cfg.use_strength_filter)}({self.cfg.strength_atr_mult}×ATR) "
+            f"未补缺{_onoff(self.cfg.use_gapfill_filter)} 锁当日{_onoff(self.cfg.first_signal_only)}",
+            f"  ▶ 下单 = 每笔账户权益×{self.size_pct*100:.0f}% (至少1张, 多张总≤预算), delta={self.target_delta}",
             f"  ▶ 模式 = {'模拟(dry-run)' if self.dry_run else '真实下单'}",
             "=" * 64,
         ]
@@ -458,7 +571,7 @@ class ORBLiveRunner:
         self.mailer.send(
             f"[ORB30v2·5min] 服务启动 {_now():%m-%d %H:%M} ET",
             "\n".join(banner)
-            + f"\ndry_run={self.dry_run} 预算=${self.budget:.0f} 目标delta={self.target_delta}\n"
+            + f"\ndry_run={self.dry_run} 下注=权益×{self.size_pct*100:.0f}% 目标delta={self.target_delta}\n"
             f"缓存bar数={len(self.strategy.df)}\n最新收盘={self.strategy.df.index.max()}",
         )
         while True:
@@ -608,10 +721,16 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="ORB30 策略 SPY 0DTE 期权 实盘/模拟盘")
     p.add_argument("--dry-run", action="store_true", help="只打印信号, 不真实下单")
-    p.add_argument("--budget", type=float, default=300.0, help="单笔期权预算/最大风险(美元), 默认 300")
+    p.add_argument("--size-pct", type=float, default=0.25,
+                   help="每笔下注占账户权益的比例, 默认 0.25")
+    p.add_argument("--fixed-budget", action="store_true",
+                   help="用固定预算而非按权益比例")
+    p.add_argument("--budget", type=float, default=300.0,
+                   help="固定预算/权益读取失败时的回退(美元), 默认 300")
     p.add_argument("--delta", type=float, default=0.50, help="目标 delta")
     p.add_argument("--max-contracts", type=int, default=None,
                    help="单笔最大张数上限 (小资金防超配, 如 1)")
     a = p.parse_args()
     ORBLiveRunner(dry_run=a.dry_run, budget=a.budget, target_delta=a.delta,
-                  max_contracts=a.max_contracts).run()
+                  max_contracts=a.max_contracts, size_pct=a.size_pct,
+                  use_equity_sizing=not a.fixed_budget).run()

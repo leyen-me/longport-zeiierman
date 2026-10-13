@@ -9,6 +9,14 @@
 //     ④ 出场: 锚 OR 边界固定 SL/TP + 0.75R 移动止损
 //        SL = 边界 ∓ slVal, TP = 边界 ± tpVal, 移动 = 极值 ∓ 0.75×R
 //     ⑤ 默认只做周一~周三 (可调)
+//     ⑥ 质变过滤 (research/orb_factors.py, 逐笔亏损归因):
+//          · 222 亏损里 58% 是"从没走出 0.25R"的死单 -> 是入场选股问题, 不是出场
+//          · 默认只开"免费"因子 (剔除净亏损单, 保留频率且总利润↑):
+//              顺势发力(entry-open≥0.15ATR) + 跳空在OR内未回补
+//          · 效果: n 664→439 (保留66%), PF 1.50→1.96, 总利润 9408→10489 (+11%),
+//                  MDD 736→608, 三段 PF 1.89/1.72/2.44
+//          · 可选"伤频率/伤收益"因子(默认关, 需要更高PF再开): 有跳空/OR相对量/早突破
+//          · 负结果: 失败突破反手(PF 0.70)、Supertrend 出场、跨品种QQQ确认 均无质变
 //
 //   回测(Mon-Wed, gap+fd 过滤): PF 2.31, 胜53.9%, 盈亏比1.52, t4.91, 每年 PF>1.4
 //     全周(5天):              PF 1.77, 胜52.8%, 盈亏比1.32, t4.59, 每年 PF>1.1
@@ -55,6 +63,20 @@ useGapFlt = input.bool(false, "跳空方向须一致", group="过滤")
 useFdFlt  = input.bool(true, "首根方向须一致", group="过滤")
 firstOnly = input.bool(true, "首个突破被过滤后锁定当日", group="过滤")
 
+// --- 质变过滤 (research/orb_factors.py) ---
+// 关键: 区分"砍亏单(免费)"与"砍赢家(伤频率/伤收益)"。
+//   免费: 顺势发力 / 跳空在OR内未回补  -> 默认开, 保留66%频率且总利润↑
+//   伤收益: 有跳空 / OR相对量 / 实体>=0.4 / brk_rvol  -> 默认关(需要更高PF再开)
+useStrFlt     = input.bool(true,  "A. 顺势发力 entry-open≥k·ATR (免费)", group="质变过滤")
+strengthATR   = input.float(0.15, "   k", minval=0, step=0.05, group="质变过滤")
+useGapFillFlt = input.bool(true,  "B. 跳空在OR内未回补 (免费)", group="质变过滤")
+useORVolFlt   = input.bool(false, "C. OR相对量≥k (伤频率)", group="质变过滤")
+orVolMin      = input.float(0.90, "   OR量/20日中位量 下限", minval=0, step=0.05, group="质变过滤")
+useGapMagFlt  = input.bool(false, "D. 有跳空 |gap|≥k·ATR (伤收益)", group="质变过滤")
+gapMagATR     = input.float(0.10, "   k", minval=0, step=0.05, group="质变过滤")
+useTimeFlt    = input.bool(false, "E. 只做早突破 ≤HH:MM (伤频率)", group="质变过滤")
+maxEntryMin   = input.int(630, "   最晚入场(分钟/日, 630=10:30)", group="质变过滤")
+
 // --- 强平 ---
 eodH = input.int(12, "强平 时", minval=0, maxval=23, inline="eod", group="强平")
 eodM = input.int(0,  "分", minval=0, maxval=59, inline="eod", group="强平")
@@ -98,12 +120,20 @@ var float tgtPx       = na
 var float Rpts        = na
 var float runExt      = na
 var float trailStop   = na
+// OR 相对成交量因子用
+var float   orVolSum   = 0.0
+var float   orVolMedian = na
+var float   dayORVol   = na
+var float[] orVolHist  = array.new_float()
+var bool    orGapFilled = false   // 跳空是否在 OR 内被回补
 
 var box[]  profitBoxes = array.new_box()
 var box[]  lossBoxes   = array.new_box()
 var line[] entryLines  = array.new_line()
 
 prevCloseD := request.security(syminfo.tickerid, "1D", close[1], lookahead=barmerge.lookahead_off)
+// 日线 ATR (质变过滤 B/C 用; 取前一日, 无前视)
+atrD       = request.security(syminfo.tickerid, "1D", ta.atr(14)[1], lookahead=barmerge.lookahead_off)
 
 // --- 新会话: 初始化 OR + 记录开盘价 & 首根方向 ---
 if rthStart and dayAllowed
@@ -120,12 +150,30 @@ if inOR and dayAllowed
     sessionHigh := math.max(sessionHigh, high)
     sessionLow  := math.min(sessionLow, low)
 
+// 跳空是否在 OR 内被回补 (因子 B: 未回补=强势)
+if rthStart
+    orGapFilled := false
+if inOR and not na(prevCloseD) and low <= prevCloseD and high >= prevCloseD
+    orGapFilled := true
+
 // 首根 K 线方向
 if inOR and dayAllowed and firstBarDir == 0
     firstBarDir := close >= open ? 1 : -1
 
 if inOR[1] and not inOR and dayAllowed
     sessionDone := true
+
+// --- OR 成交量 & 相对量 (因子 D; 用 RTH 首 orBars 根) ---
+if rthStart
+    orVolSum := 0.0
+if inOR
+    orVolSum += volume
+if inOR[1] and not inOR
+    orVolMedian := array.size(orVolHist) >= 10 ? array.median(orVolHist) : na
+    dayORVol    := orVolSum
+    if array.size(orVolHist) >= 20
+        array.shift(orVolHist)
+    array.push(orVolHist, orVolSum)
 
 // --- 突破计数 ---
 if sessionDone
@@ -141,15 +189,27 @@ if sessionDone
 
 // --- 过滤条件 (入场时刻已知) ---
 gapKnown = not na(prevCloseD) and not na(dayOpenPx)
+gapPts   = gapKnown ? dayOpenPx - prevCloseD : na
 gapUp    = gapKnown and dayOpenPx > prevCloseD
 gapDown  = gapKnown and dayOpenPx < prevCloseD
+
+// --- 质变过滤条件 ---
+atrOk      = not na(atrD) and atrD > 0
+strLong0   = not useStrFlt or not atrOk or (close - dayOpenPx) >= strengthATR * atrD
+strShort0  = not useStrFlt or not atrOk or (dayOpenPx - close) >= strengthATR * atrD
+gapFillOk  = not useGapFillFlt or not gapKnown or not orGapFilled
+gapMagOk   = not useGapMagFlt or not gapKnown or not atrOk or math.abs(gapPts) >= gapMagATR * atrD
+timeOk     = not useTimeFlt or barMinEod <= maxEntryMin
+orVolRel   = (not na(dayORVol) and not na(orVolMedian) and orVolMedian > 0) ? dayORVol / orVolMedian : na
+orVolOk    = not useORVolFlt or na(orVolRel) or orVolRel >= orVolMin
+entryQual  = gapFillOk and gapMagOk and timeOk and orVolOk
 
 // --- 入场 ---
 if sessionDone and not tradedToday and dayAllowed and not eodPassed
     longSig  = bullCount >= brkCandles
     shortSig = bearCount >= brkCandles
-    longOk   = longSig  and (not useGapFlt or not gapKnown or gapUp)   and (not useFdFlt or firstBarDir > 0)
-    shortOk  = shortSig and (not useGapFlt or not gapKnown or gapDown) and (not useFdFlt or firstBarDir < 0)
+    longOk   = longSig  and (not useGapFlt or not gapKnown or gapUp)   and (not useFdFlt or firstBarDir > 0) and entryQual and strLong0
+    shortOk  = shortSig and (not useGapFlt or not gapKnown or gapDown) and (not useFdFlt or firstBarDir < 0) and entryQual and strShort0
     // firstOnly: 首个突破一出现即锁当日 (即使被过滤, 也不再等反向突破) —— 与引擎/实盘一致
     if firstOnly and (longSig or shortSig)
         tradedToday := true
