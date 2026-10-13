@@ -48,6 +48,10 @@ def _et_minutes(now: datetime) -> int:
     return now.hour * 60 + now.minute
 
 
+def _onoff(v: bool) -> str:
+    return "开" if v else "关"
+
+
 class ORBLiveRunner:
     def __init__(self, dry_run: bool = False, budget: float = 300.0,
                  target_delta: float = 0.50, max_contracts: int | None = None,
@@ -439,16 +443,22 @@ class ORBLiveRunner:
     def run(self):
         self.sync_history()
         self.subscribe()
-        log.info(
-            f"启动完成: dry_run={self.dry_run} 预算={self.budget} "
-            f"目标delta={self.target_delta} "
-            f"至少1张(不限价){'/最多%s张' % self.max_contracts if self.max_contracts else ''} "
-            f"OR={self.cfg.or_minutes}min "
-            f"SL/TP={self.cfg.sl_points}/{self.cfg.tp_points}点 强平={self.cfg.eod_hour}:{self.cfg.eod_minute:02d}"
-        )
+        banner = [
+            "=" * 64,
+            "  ▶ 策略 = ORB30 v2   (5分钟K线 · Python ztp.orb_runner)",
+            f"  ▶ 规则 = OR={self.cfg.or_minutes}min 确认{self.cfg.brk_candles}根 交易日={self.cfg.trade_days}",
+            f"  ▶ 过滤 = 跳空{_onoff(self.cfg.use_gap_filter)} 首根{_onoff(self.cfg.use_firstbar_filter)} "
+            f"锁当日{_onoff(self.cfg.first_signal_only)} 移动止损{_onoff(self.cfg.use_trail)}",
+            f"  ▶ 下单 = 至少1张(不限价), 多张总≤${self.budget:.0f}, delta={self.target_delta}",
+            f"  ▶ 模式 = {'模拟(dry-run)' if self.dry_run else '真实下单'}",
+            "=" * 64,
+        ]
+        for line in banner:
+            log.info(line)
         self.mailer.send(
-            f"[ORB] 服务启动 {_now():%m-%d %H:%M} ET",
-            f"dry_run={self.dry_run}\n预算=${self.budget:.0f} 目标delta={self.target_delta}\n"
+            f"[ORB30v2·5min] 服务启动 {_now():%m-%d %H:%M} ET",
+            "\n".join(banner)
+            + f"\ndry_run={self.dry_run} 预算=${self.budget:.0f} 目标delta={self.target_delta}\n"
             f"缓存bar数={len(self.strategy.df)}\n最新收盘={self.strategy.df.index.max()}",
         )
         while True:

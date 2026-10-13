@@ -441,12 +441,13 @@ class LiveRunner:
     def run(self):
         self.sync_history()
         self.subscribe()
-        log.info(
-            f"启动完成: dry_run={self.dry_run} 预算={self.budget} "
-            f"目标delta={self.target_delta} 账户={'模拟' if not self.dry_run else 'N/A'}"
-        )
+        log.info("=" * 64)
+        log.info("  ▶ 策略 = ZTP  (2分钟K线 · Python ztp.runner)   ← 非 ORB")
+        log.info(f"  ▶ dry_run={self.dry_run} 预算=${self.budget:.0f} 目标delta={self.target_delta}")
+        log.info("=" * 64)
         self.mailer.send(
-            f"[ZTP] 服务启动 {_now():%m-%d %H:%M} ET",
+            f"[ZTP·2min] 服务启动 {_now():%m-%d %H:%M} ET",
+            f"策略=ZTP (2分钟)  ← 非 ORB\n"
             f"dry_run={self.dry_run}\n预算=${self.budget:.0f} 目标delta={self.target_delta}\n"
             f"缓存bar数={len(self.strategy.df)}\n最新收盘={self.strategy.df.index.max()}",
         )
