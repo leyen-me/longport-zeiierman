@@ -3,6 +3,7 @@ services:
     build: .
     container_name: ztp-live
     environment:
+      - STRATEGY=${STRATEGY:-ztp.orb_runner}
       - LONGPORT_APP_KEY=${LONGPORT_APP_KEY:-}
       - LONGPORT_APP_SECRET=${LONGPORT_APP_SECRET:-}
       - LONGPORT_ACCESS_TOKEN=${LONGPORT_ACCESS_TOKEN:-}

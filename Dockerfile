@@ -22,4 +22,6 @@ USER trader
 
 VOLUME ["/app/data_cache", "/app/results"]
 
-CMD ["python", "-m", "ztp.runner"]
+# 策略入口: 默认 ORB30 v2 (5min); 跑 ZTP 老策略则设 STRATEGY=ztp.runner
+ENV STRATEGY=ztp.orb_runner
+CMD ["sh", "-c", "exec python -m ${STRATEGY}"]

@@ -129,8 +129,15 @@ docker run -d --name ztp-live \
 docker logs -f ztp-live
 ```
 
-Zeabur / Railway 等 PaaS：直接导入 GitHub 仓库，在环境变量里配置上述三项即可，
-启动命令为 `python -m ztp.runner`。
+Zeabur / Railway 等 PaaS：直接导入 GitHub 仓库，在环境变量里配置长桥三项即可。
+
+**启动策略由 `STRATEGY` 环境变量决定**（Dockerfile 已内置，默认 ORB30 v2）：
+- `STRATEGY=ztp.orb_runner`（默认）→ ORB30 v2（5min）
+- `STRATEGY=ztp.runner` → ZTP（2min）
+
+> ⚠️ 若在 Zeabur 控制台里手填了 "Start Command"，它会**覆盖** Dockerfile 的 CMD——
+> 上线 ORB 请把 Start Command 设为 `python -m ztp.orb_runner`（或留空用默认）。
+> 启动日志出现 `[ORB] 服务启动` 且订阅 "5分钟K线" 才是对的。
 
 > 系统层面持久化：写入 `/etc/environment`、systemd unit 的 `Environment=`，
 > 或 `~/.zshrc` 均可——程序只认环境变量本身。
