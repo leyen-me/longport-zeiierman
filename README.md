@@ -40,11 +40,13 @@
 │   ├── config.py / engine.py / live.py / runner.py / signals.py / tvfuncs.py
 │   │                         # ZTP 策略 (另一套)
 │   ├── logging.py / mailer.py / paths.py
+│   ├── lottery.py            # 大乐透对奖 + 中奖判定 (复用 mailer 发 QQ 邮件)
 ├── scripts/                  # 回测/比对/实盘入口
 │   ├── run_orb.py            # ORB v2 回测
 │   ├── orb_live.py           # ORB v2 实盘入口 (dry-run 支持)
 │   ├── compare_orb.py        # 与 TV 成交明细逐笔比对
 │   ├── live_run.py / run_backtest.py / compare_tv.py   # ZTP 入口
+│   ├── check_lottery.py      # 大乐透对奖入口 (中奖发邮件)
 ├── research/                 # 研究脚本 (非生产, 见 research/README.md)
 ├── tests/                    # 单元测试 (见下)
 ├── tradingview/              # Pine 脚本 (ORB30_v2.pine 为生产版本)
@@ -74,6 +76,37 @@
 # 或: python -m ztp.orb_runner --dry-run
 ```
 
+## 大乐透对奖
+
+每期固定买 5 组号（见 `ztp/lottery.py` 的 `TICKETS`），脚本拉体彩官方开奖号比对，
+中奖就通过 QQ 邮箱发通知。**独立实现**：不 import、不改动任何交易代码，但复用项目已有的
+`MSG_SMTP_*` 邮箱配置。
+
+```bash
+.venv/bin/python scripts/check_lottery.py                    # 查最近一期, 中奖发邮件
+.venv/bin/python scripts/check_lottery.py --draw 26116       # 查指定期号
+.venv/bin/python scripts/check_lottery.py --fake "09 18 22 25 35 01 10"  # 合成号码测判定
+.venv/bin/python scripts/check_lottery.py --wait 40          # 等当天新开奖(定时任务用)
+.venv/bin/python scripts/check_lottery.py --test-email       # 验证邮箱配置
+```
+
+- **规则**：2026-02 起新规 7 奖级；追加投注仅对一、二等奖加成（追加单注 = 基本 ×80%），
+  三～七等奖为固定奖，追加不加钱。
+- **邮箱配置**（`.env`）：`MSG_SMTP_USERNAME`（QQ 号@qq.com）、`MSG_SMTP_PASSWORD`（SMTP
+  授权码，非登录密码）、`QQ_NOTIFY_TO`（收件箱，默认发件箱自身）。与交易信号通知同一套配置。
+- **每期自动跑（Docker 单容器）**：大乐透每周一/三/六 21:25（北京时间）开奖，脚本带
+  `--wait 40`（拉不到当天新开奖就每 5 分钟重试，最多 40 分钟），并按期号去重（同期只发一次）。
+  容器只跑交易，彩票对奖由**宿主机 cron** 定期 `docker exec` 进容器触发，两者互不影响：
+  ```cron
+  # crontab -e  (CRON_TZ 让计划按北京时间走, 服务器在日本也不用换算)
+  CRON_TZ=Asia/Shanghai
+  # 22:00 北京时间 = 开奖后约 35 分钟; docker exec 会继承容器的 MSG_SMTP_* 环境变量
+  0 22 * * 1,3,6 docker exec ztp-live python /app/scripts/check_lottery.py --wait 40 >> /var/log/dlt-lottery.log 2>&1
+  ```
+  前提：启动容器时把邮箱配置也传进去（见下方 `docker run` 示例里的 `MSG_SMTP_*`）。
+  手动跑一次：`docker exec ztp-live python /app/scripts/check_lottery.py`。
+  去重状态写在 `results/lottery_state.json`（已随 `results` 卷持久化）。
+
 ## 测试
 
 无需 pytest，直接用内置 runner（每个测试文件也可单独运行）：
@@ -90,6 +123,7 @@
 | `test_orb_live_consistency.py` | 状态机逐笔 == 引擎（合成 + 参考数据，含多组参数） |
 | `test_option_sizing.py` | 期权定量规则 |
 | `test_live_consistency.py` | ZTP 状态机 == ZTP 引擎 |
+| `test_lottery.py` | 大乐透奖级判定 + 奖金计算（离线） |
 
 ## 快速开始
 
@@ -122,12 +156,17 @@ docker run -d --name ztp-live \
   -e LONGPORT_APP_KEY=xxx \
   -e LONGPORT_APP_SECRET=xxx \
   -e LONGPORT_ACCESS_TOKEN=xxx \
+  -e MSG_SMTP_USERNAME=xxx@qq.com \
+  -e MSG_SMTP_PASSWORD=xxx \
   -v $(pwd)/data_cache:/app/data_cache \
   -v $(pwd)/results:/app/results \
   --restart unless-stopped \
   $(docker build -q .)
 docker logs -f ztp-live
 ```
+
+> 大乐透对奖用的 `MSG_SMTP_*`（QQ 邮箱账号/授权码）也在上面一起 `-e` 注入；即使只跑交易，
+> 加上它们也不会影响交易——只在大乐透脚本里被读取。
 
 Zeabur / Railway 等 PaaS：直接导入 GitHub 仓库，在环境变量里配置长桥三项即可。
 
