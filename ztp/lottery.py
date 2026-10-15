@@ -1,7 +1,9 @@
 """超级大乐透每期对奖 + 中奖邮件通知。
 
 - 固定 5 组号码 (每期买的), 与官方开奖号比对, 判定奖级, 计算实得奖金。
-- 开奖号来源: 中国体彩官方接口 webapi.sporttery.cn (gameNo=85), 无需凭证。
+- 开奖号来源: 中国体彩官方接口 webapi.sporttery.cn (gameNo=85); 该接口对海外/机房 IP
+  地域封锁(HTTP 567), 故内置备用源 500.com (海外可访问) 自动回退。可用 LOTTERY_HTTP_PROXY
+  或标准 https_proxy 走代理直连官方源。
 
 规则 (2026-02 起新规, 9 奖级合并为 7 奖级):
   一等奖 5+2      浮动奖 (追加单注 = 基本 ×80%)
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import smtplib
 import ssl
 import urllib.request
@@ -35,9 +38,16 @@ from email.utils import formatdate, make_msgid
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
 
-API_URL = (
+# 官方源: 中国体彩 webapi (字段最全, 但对海外/机房 IP 地域封锁返回 567)
+SPORTTERY_URL = (
     "https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry"
     "?gameNo=85&provinceId=0&pageSize={page_size}&isVerify=1&pageNo={page_no}"
+)
+# 备用源: 500.com (海外可访问; 一等奖/二等奖金额取自页面, 固定奖按规则推算)
+WUBAI_URL = "https://datachart.500.com/dlt/history/newinc/history.php?{q}"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
 # 每期固定购买的 5 组号码: (前区 5 个, 后区 2 个)
@@ -76,26 +86,39 @@ class TicketResult:
     amount: int            # 实得金额 (基本+追加)
 
 
-def fetch_draws(page_size: int = 30, page_no: int = 1, timeout: int = 20) -> list[Draw]:
-    """拉取最近的若干期开奖数据 (最近的在最前)。"""
-    url = API_URL.format(page_size=page_size, page_no=page_no)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-            "Referer": "https://www.lottery.gov.cn/",
-        },
+def _http_get(url: str, referer: str, timeout: int) -> str:
+    """GET 文本。代理: 显式读 LOTTERY_HTTP_PROXY, 否则用标准 https_proxy 环境变量。"""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": referer})
+    proxy = (
+        os.environ.get("LOTTERY_HTTP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
     )
-    ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy} if proxy else None)
+    opener = urllib.request.build_opener(
+        handler, urllib.request.HTTPSHandler(context=ssl.create_default_context())
+    )
+    with opener.open(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "ignore")
 
+
+def _num(s) -> int | None:
+    try:
+        return int(str(s).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def _fetch_sporttery(page_size: int, page_no: int, timeout: int) -> list[Draw]:
+    """官方接口 (字段最全, 含全部奖级金额与追加)。海外可能被 567 拦截。"""
+    txt = _http_get(
+        SPORTTERY_URL.format(page_size=page_size, page_no=page_no),
+        "https://www.lottery.gov.cn/",
+        timeout,
+    )
+    data = json.loads(txt)
     if not data.get("success"):
-        raise RuntimeError(f"接口返回失败: {data.get('errorMessage')}")
-
+        raise RuntimeError(f"官方接口失败: {data.get('errorMessage')}")
     draws: list[Draw] = []
     for item in data["value"]["list"]:
         nums = [int(x) for x in item["lotteryDrawResult"].split()]
@@ -112,21 +135,98 @@ def fetch_draws(page_size: int = 30, page_no: int = 1, timeout: int = 20) -> lis
     return draws
 
 
+def _levels_from_500(amt1, amt2, pool_before: int | None) -> list[dict]:
+    """用 500.com 的一/二等奖金 + 规则推算的固定奖, 合成与官方同构的 levels 表。"""
+    hi = pool_before is not None and pool_before >= 800_000_000  # 奖池≥8亿, 固定奖上浮
+    f3, f4, f5, f6, f7 = (6666, 380, 200, 18, 7) if hi else (5000, 300, 150, 15, 5)
+    def fmt(v):
+        return str(v) if v is not None else "-1"
+    return [
+        {"prizeLevel": "一等奖", "stakeAmountFormat": fmt(_num(amt1))},
+        {"prizeLevel": "二等奖", "stakeAmountFormat": fmt(_num(amt2))},
+        {"prizeLevel": "三等奖", "stakeAmountFormat": str(f3)},
+        {"prizeLevel": "四等奖", "stakeAmountFormat": str(f4)},
+        {"prizeLevel": "五等奖", "stakeAmountFormat": str(f5)},
+        {"prizeLevel": "六等奖", "stakeAmountFormat": str(f6)},
+        {"prizeLevel": "七等奖", "stakeAmountFormat": str(f7)},
+    ]
+
+
+def _fetch_500(limit: int = 30, timeout: int = 20, start=None, end=None) -> list[Draw]:
+    """备用源 500.com。start/end 按期号区间查, 否则取最近 limit 期。"""
+    if start is not None and end is not None:
+        q = f"start={start}&end={end}"
+    else:
+        q = f"limit={max(limit + 1, 2)}&sort=0"  # 多取一行, 供算上一期奖池
+    html = _http_get(WUBAI_URL.format(q=q), "https://datachart.500.com/", timeout)
+    html = re.sub(r"<!--.*?-->", "", html, flags=re.S)
+    block = re.search(r'<tbody id="tdata">(.*?)</tbody>', html, flags=re.S)
+    body = block.group(1) if block else html
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body, flags=re.S):
+        tds = [re.sub(r"<[^>]+>", "", t).strip()
+               for t in re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.S)]
+        if len(tds) >= 15:
+            rows.append(tds)
+
+    draws: list[Draw] = []
+    for i, tds in enumerate(rows):
+        prev_pool = _num(rows[i + 1][8]) if i + 1 < len(rows) else None
+        draws.append(
+            Draw(
+                draw_num=tds[0],
+                draw_time=tds[14],
+                front=[int(tds[j]) for j in range(1, 6)],
+                back=[int(tds[j]) for j in range(6, 8)],
+                pool_after=str(_num(tds[8]) or ""),
+                levels=_levels_from_500(tds[10], tds[12], prev_pool),
+            )
+        )
+    if start is not None and end is not None:
+        return draws
+    return draws[:limit]
+
+
+def fetch_draws(page_size: int = 30, page_no: int = 1, timeout: int = 20) -> list[Draw]:
+    """拉取最近的若干期开奖数据 (最近的在最前)。官方源优先, 被地域封锁时回退 500.com。"""
+    try:
+        return _fetch_sporttery(page_size, page_no, timeout)
+    except Exception as e:
+        if page_no == 1:
+            try:
+                return _fetch_500(limit=page_size, timeout=timeout)
+            except Exception:
+                pass
+        raise RuntimeError(f"开奖数据源均不可用: {e}")
+
+
 def fetch_latest(timeout: int = 20) -> Draw:
     """取最近一期开奖。"""
     draws = fetch_draws(page_size=1, timeout=timeout)
     if not draws:
-        raise RuntimeError("接口未返回任何开奖数据")
+        raise RuntimeError("未取到任何开奖数据")
     return draws[0]
 
 
-def fetch_by_draw_num(draw_num: str, max_pages: int = 5) -> Draw | None:
-    """按期号精确查找 (逐页翻, 找不到返回 None)。"""
-    for page in range(1, max_pages + 1):
-        for d in fetch_draws(page_size=30, page_no=page):
-            if d.draw_num == str(draw_num):
+def fetch_by_draw_num(draw_num: str, max_pages: int = 5, timeout: int = 20) -> Draw | None:
+    """按期号精确查找 (找不到返回 None)。"""
+    target = str(draw_num)
+    try:
+        for page in range(1, max_pages + 1):
+            for d in _fetch_sporttery(30, page, timeout):
+                if d.draw_num == target:
+                    return d
+        return None
+    except Exception:
+        try:
+            n = int(target)
+            draws = _fetch_500(timeout=timeout, start=n - 1, end=n)
+        except Exception:
+            return None
+        for d in draws:
+            if d.draw_num == target:
                 return d
-    return None
+        return None
 
 
 def judge_tier(front_hits: int, back_hits: int) -> int:

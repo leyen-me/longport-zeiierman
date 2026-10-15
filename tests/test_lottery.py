@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ztp.lottery import (
-    Draw, TICKETS, check_draw, judge_tier, ticket_amount,
+    Draw, TICKETS, check_draw, judge_tier, ticket_amount, _levels_from_500,
 )
 
 # 合成奖金表 (奖池 < 8 亿时的固定奖金额)
@@ -69,9 +69,30 @@ def test_check_draw_none():
     print("  未中奖判定通过")
 
 
+def test_500_fallback_levels():
+    # 备用源合成奖级表: 固定奖按上一期奖池是否≥8亿 决定是否上浮
+    def amt(levels, name):
+        return [x["stakeAmountFormat"] for x in levels if x["prizeLevel"] == name][0]
+
+    lo = _levels_from_500("5,834,813", "53,634", 700_000_000)
+    assert amt(lo, "一等奖") == "5834813"
+    assert amt(lo, "三等奖") == "5000"
+    assert amt(lo, "七等奖") == "5"
+
+    hi = _levels_from_500("1,000,000", "100,000", 900_000_000)
+    assert amt(hi, "三等奖") == "6666"
+    assert amt(hi, "七等奖") == "7"
+
+    miss = _levels_from_500("-", "-", None)   # 无人中一等/二等时占位
+    assert amt(miss, "一等奖") == "-1"
+    assert ticket_amount(1, miss, append=True) == 0
+    print("  备用源(500.com)奖级推算通过")
+
+
 if __name__ == "__main__":
     test_tier_mapping()
     test_amounts()
+    test_500_fallback_levels()
     test_check_draw_hit()
     test_check_draw_none()
     print("lottery 测试全部通过")
