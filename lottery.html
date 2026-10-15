@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>大乐透 · 选号单</title>
+<style>
+  :root{
+    --green:#07c160;
+    --red:#fa5151;
+    --blue:#1485ee;
+    --ink:#191919;
+    --gray:#888;
+    --light:#c9c9c9;
+    --hair:#ededed;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:#e8e8e8;
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    color:var(--ink);
+    -webkit-print-color-adjust:exact;
+    print-color-adjust:exact;
+  }
+
+  .page{
+    width:210mm;min-height:297mm;
+    margin:18px auto;
+    background:#fff;
+    padding:20mm 22mm;
+    display:flex;flex-direction:column;
+    box-shadow:0 4px 24px rgba(0,0,0,.12);
+  }
+
+  /* 页眉 */
+  .head{
+    display:flex;align-items:center;gap:3mm;
+    padding-bottom:6mm;border-bottom:1px solid var(--hair);
+  }
+  .dot{
+    width:9mm;height:9mm;border-radius:2.4mm;
+    background:var(--green);flex:0 0 auto;
+    display:flex;align-items:center;justify-content:center;
+    color:#fff;font-size:11pt;font-weight:600;
+  }
+  .head h1{margin:0;font-size:15pt;font-weight:600;letter-spacing:1px;}
+  .head .sub{margin-left:auto;font-size:8.5pt;color:var(--gray);letter-spacing:2px;}
+
+  /* 列表 */
+  .list{
+    flex:1 1 auto;
+    display:flex;flex-direction:column;justify-content:space-between;
+    padding:10mm 0;
+    gap:6mm;
+  }
+  .ticket{
+    flex:1 1 0;min-height:0;
+    display:flex;align-items:center;gap:6mm;
+    padding:0 8mm;
+    border:1px dashed #dcdcdc;
+    border-radius:3mm;
+  }
+  .no{
+    flex:0 0 auto;
+    font-size:9pt;color:var(--gray);
+    font-variant-numeric:tabular-nums;
+    letter-spacing:1px;
+    width:16mm;
+  }
+  .no i{display:block;font-size:6.5pt;font-style:normal;color:var(--light);margin-top:1mm;letter-spacing:2px;}
+
+  .balls{
+    flex:1 1 auto;
+    display:flex;align-items:center;justify-content:center;gap:3.2mm;
+  }
+  .ball{
+    width:13mm;height:13mm;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;
+    font-size:13pt;font-weight:500;color:#fff;
+    font-variant-numeric:tabular-nums;
+  }
+  .ball.red{background:var(--red);}
+  .ball.blue{background:var(--blue);}
+  .sep{width:6mm;text-align:center;color:var(--light);font-size:13pt;}
+
+  /* 页脚 */
+  .foot{
+    padding-top:6mm;border-top:1px solid var(--hair);
+    display:flex;justify-content:flex-end;align-items:center;
+    font-size:7.5pt;color:var(--light);letter-spacing:1px;
+  }
+
+  @media print{
+    @page{size:A4;margin:0;}
+    body{background:#fff;}
+    .page{margin:0;box-shadow:none;min-height:auto;height:297mm;}
+  }
+</style>
+</head>
+<body>
+  <div class="page">
+
+    <div class="head">
+      <div class="dot">乐</div>
+      <h1>大乐透选号单</h1>
+      <div class="sub">前区 01–35　后区 01–12</div>
+    </div>
+
+    <div class="list">
+
+      <div class="ticket">
+        <div class="no">01<i>第一组</i></div>
+        <div class="balls">
+          <span class="ball red">07</span>
+          <span class="ball red">13</span>
+          <span class="ball red">22</span>
+          <span class="ball red">32</span>
+          <span class="ball red">35</span>
+          <span class="sep">+</span>
+          <span class="ball blue">08</span>
+          <span class="ball blue">11</span>
+        </div>
+      </div>
+
+      <div class="ticket">
+        <div class="no">02<i>第二组</i></div>
+        <div class="balls">
+          <span class="ball red">03</span>
+          <span class="ball red">11</span>
+          <span class="ball red">19</span>
+          <span class="ball red">28</span>
+          <span class="ball red">33</span>
+          <span class="sep">+</span>
+          <span class="ball blue">04</span>
+          <span class="ball blue">09</span>
+        </div>
+      </div>
+
+      <div class="ticket">
+        <div class="no">03<i>第三组</i></div>
+        <div class="balls">
+          <span class="ball red">06</span>
+          <span class="ball red">14</span>
+          <span class="ball red">20</span>
+          <span class="ball red">27</span>
+          <span class="ball red">34</span>
+          <span class="sep">+</span>
+          <span class="ball blue">02</span>
+          <span class="ball blue">12</span>
+        </div>
+      </div>
+
+      <div class="ticket">
+        <div class="no">04<i>第四组</i></div>
+        <div class="balls">
+          <span class="ball red">05</span>
+          <span class="ball red">16</span>
+          <span class="ball red">21</span>
+          <span class="ball red">29</span>
+          <span class="ball red">31</span>
+          <span class="sep">+</span>
+          <span class="ball blue">05</span>
+          <span class="ball blue">10</span>
+        </div>
+      </div>
+
+      <div class="ticket">
+        <div class="no">05<i>第五组</i></div>
+        <div class="balls">
+          <span class="ball red">08</span>
+          <span class="ball red">15</span>
+          <span class="ball red">17</span>
+          <span class="ball red">24</span>
+          <span class="ball red">30</span>
+          <span class="sep">+</span>
+          <span class="ball blue">03</span>
+          <span class="ball blue">07</span>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="foot">
+      <span>共 5 组</span>
+    </div>
+
+  </div>
+</body>
+</html>
